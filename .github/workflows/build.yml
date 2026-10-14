@@ -31,6 +31,9 @@ jobs:
           brew update
           mkdir -p "$RUNNER_TEMP/bottles"
           cd "$RUNNER_TEMP/bottles"
+          # On Intel macOS 15, some dependencies have no bottles.
+          # Build dependencies from source first, then build the target in bottle mode.
+          brew install --only-dependencies --build-from-source --verbose "$FORMULA" 2>&1 | tee dependencies.log
           brew install --build-bottle --verbose "$FORMULA" 2>&1 | tee build.log
           brew bottle --json "$FORMULA" 2>&1 | tee bottle.log
       - name: Upload build logs and bottles
