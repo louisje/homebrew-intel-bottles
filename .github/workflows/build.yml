@@ -1,0 +1,46 @@
+name: Build Intel Bottles
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build.yml'
+jobs:
+  bottle:
+    name: ${{ matrix.formula }}
+    runs-on: macos-15-intel
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        formula: [gcc, apache-arrow, openjdk, aws-sdk-cpp, grpc]
+    steps:
+      - name: Environment
+        run: |
+          uname -m
+          sw_vers
+          brew config
+          df -h .
+      - name: Build and bottle
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_CLEANUP: '1'
+          FORMULA: ${{ matrix.formula }}
+        run: |
+          set -euo pipefail
+          brew update
+          mkdir -p "$RUNNER_TEMP/bottles"
+          cd "$RUNNER_TEMP/bottles"
+          brew install --build-bottle --verbose "$FORMULA" 2>&1 | tee build.log
+          brew bottle --json "$FORMULA" 2>&1 | tee bottle.log
+      - name: Upload build logs and bottles
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.formula }}-intel
+          path: |
+            ${{ runner.temp }}/bottles/*.tar.gz
+            ${{ runner.temp }}/bottles/*.json
+            ${{ runner.temp }}/bottles/*.log
+          if-no-files-found: warn
+          retention-days: 30
