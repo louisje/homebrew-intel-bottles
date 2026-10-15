@@ -1,19 +1,48 @@
 name: Build Intel Bottles
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - '.github/workflows/build.yml'
+    inputs:
+      formulae:
+        description: 'Comma-separated formulae (leave blank for recommended batch)'
+        required: false
+        default: 'llvm,rust,openvino,boost,protobuf'
+        type: string
+      skip_if_bottled:
+        description: 'Skip formulae already bottled for Intel Sequoia'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - id: matrix
+        env:
+          FORMULAE: ${{ inputs.formulae }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, re
+          raw = os.environ.get("FORMULAE") or "llvm,rust,openvino,boost,protobuf"
+          names = list(dict.fromkeys(x.strip() for x in raw.split(",") if x.strip()))
+          if not names or len(names) > 20 or any(not re.fullmatch(r"[a-zA-Z0-9@+_.-]+", n) for n in names):
+              raise SystemExit("Expected 1–20 comma-separated Homebrew formula names")
+          print("matrix=" + json.dumps({"formula": names}))
+          PY
+
   bottle:
+    needs: prepare
     name: ${{ matrix.formula }}
     runs-on: macos-15-intel
     timeout-minutes: 360
     strategy:
       fail-fast: false
       max-parallel: 5
-      matrix:
-        formula: [gcc, apache-arrow, openjdk, aws-sdk-cpp, grpc]
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
       - name: Environment
         run: |
@@ -21,21 +50,53 @@ jobs:
           sw_vers
           brew config
           df -h .
-      - name: Build and bottle
+      - name: Check bottle availability
+        id: preflight
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          FORMULA: ${{ matrix.formula }}
+          SKIP_IF_BOTTLED: ${{ inputs.skip_if_bottled }}
+        run: |
+          set -euo pipefail
+          brew update
+          brew info --json=v2 "$FORMULA" > "$RUNNER_TEMP/formula-info.json"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          data = json.load(open(os.environ["RUNNER_TEMP"] + "/formula-info.json"))
+          formula = data["formulae"][0]
+          files = (formula.get("bottle") or {}).get("stable", {}).get("files") or {}
+          tag = "sequoia" if os.uname().machine == "arm64" else "sequoia"
+          # Homebrew may use the generic Intel tag or a compatible older macOS bottle.
+          available = any(k == tag or k.startswith(tag + "_") for k in files)
+          print("available=" + str(available).lower())
+          print("skip=" + str(available and os.getenv("SKIP_IF_BOTTLED", "true").lower() == "true").lower())
+          PY
+          brew unbottled --tag=sequoia 2>&1 | head -80 || true
+      - name: Build dependencies and bottle
+        if: steps.preflight.outputs.skip != 'true'
         env:
           HOMEBREW_NO_AUTO_UPDATE: '1'
           HOMEBREW_NO_INSTALL_CLEANUP: '1'
           FORMULA: ${{ matrix.formula }}
         run: |
           set -euo pipefail
-          brew update
           mkdir -p "$RUNNER_TEMP/bottles"
           cd "$RUNNER_TEMP/bottles"
-          # On Intel macOS 15, some dependencies have no bottles.
-          # Build dependencies from source first, then build the target in bottle mode.
+          # Save the exact recursive dependency list before installation.
+          brew deps --include-build --include-test --tree "$FORMULA" > dependency-tree.log
+          brew deps --include-build --include-test "$FORMULA" | sort -u > dependency-list.txt
           brew install --only-dependencies --build-from-source --verbose "$FORMULA" 2>&1 | tee dependencies.log
           brew install --build-bottle --verbose "$FORMULA" 2>&1 | tee build.log
           brew bottle --json "$FORMULA" 2>&1 | tee bottle.log
+          # Preserve locally built dependencies as installable bottles where supported.
+          while IFS= read -r dep; do
+            [[ -n "$dep" ]] || continue
+            if brew list --formula "$dep" >/dev/null 2>&1; then
+              echo "Bottling dependency: $dep" | tee -a dependency-bottles.log
+              brew bottle --json "$dep" >> dependency-bottles.log 2>&1 || echo "Unable to bottle $dep" >> dependency-bottles.log
+            fi
+          done < dependency-list.txt
+          shasum -a 256 ./*.tar.gz > SHA256SUMS
       - name: Upload build logs and bottles
         if: always()
         uses: actions/upload-artifact@v4
@@ -45,5 +106,37 @@ jobs:
             ${{ runner.temp }}/bottles/*.tar.gz
             ${{ runner.temp }}/bottles/*.json
             ${{ runner.temp }}/bottles/*.log
+            ${{ runner.temp }}/bottles/*.txt
+            ${{ runner.temp }}/bottles/SHA256SUMS
           if-no-files-found: warn
           retention-days: 30
+
+  publish:
+    needs: [prepare, bottle]
+    if: always() && needs.bottle.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-intel'
+          path: release
+          merge-multiple: false
+      - name: Publish bottles to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: bottles-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' files < <(find release -type f \( -name '*.tar.gz' -o -name '*.json' -o -name 'SHA256SUMS' \) -print0)
+          if (( ${#files[@]} == 0 )); then
+            echo "No bottles were produced; skipping release"
+            exit 0
+          fi
+          # Prefix names with the formula to avoid collisions among dependency bottles.
+          mkdir -p upload
+          for file in "${files[@]}"; do
+            folder=$(basename "$(dirname "$file")")
+            cp "$file" "upload/${folder}--$(basename "$file")"
+          done
+          gh release create "$TAG" upload/* --title "Intel macOS 15 Bottles ($TAG)" --notes "Built on macos-15-intel. Includes dependency bottles where Homebrew supports bottling. Check logs and SHA256SUMS before installation." --latest=false
