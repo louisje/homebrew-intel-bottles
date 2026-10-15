@@ -41,7 +41,7 @@ class BottleTests(unittest.TestCase):
 
     def test_installed_dependency_with_different_version_is_preserved(self):
         def info(name):
-            return {"name": name, "versions": {"stable": "3.5.9" if name == "openssl@3" else "1.37.0"},
+            return {"name": name, "tap": "homebrew/core", "versions": {"stable": "3.5.9" if name == "openssl@3" else "1.37.0"},
                     "revision": 3 if name == "aria2" else 0, "bottle": {}}
         with (
             patch.object(module, "dependencies", return_value=["openssl@3"]),
@@ -107,7 +107,7 @@ class BottleTests(unittest.TestCase):
             self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_planning_includes_dependencies_before_target(self):
-        formula = lambda n: {"name": n, "versions": {"stable": "1"}, "bottle": {}}
+        formula = lambda n: {"name": n, "tap": "homebrew/core", "versions": {"stable": "1"}, "bottle": {}}
         with (
             patch.object(module, "dependencies", return_value=["abseil"]),
             patch.object(module, "brew", return_value="/usr/local/Cellar"),
@@ -231,7 +231,8 @@ class BottleTests(unittest.TestCase):
 
     def test_build_avoids_repeated_active_job(self):
         with patch.object(module, "formula_info",
-                          return_value={"name": "aria2", "versions": {"stable": "1.37.0"}, "revision": 3}), \
+                          return_value={"name": "aria2", "tap": "homebrew/core", "versions": {"stable": "1.37.0"}, "revision": 3}), \
+             patch.object(module, "dependencies", return_value=[]), \
              patch.object(module, "show_cloud_jobs", return_value=([], True)), \
              patch.object(module, "dispatch_build") as dispatch:
             self.assertEqual(module.trigger_build(["aria2"]), 0)
@@ -339,6 +340,173 @@ class BottleTests(unittest.TestCase):
             self.assertEqual([j.name for j in module.WorkflowCatalog(history_limit=20).all()],
                              ["aria2", "protobuf"])
             self.assertEqual(api.call_count, 5)
+
+
+    def test_root_metadata_resolves_unqualified_and_core_qualified_taps(self):
+        payload = {"formulae": [
+            {"name": "aria2", "full_name": "aria2", "tap": "homebrew/core"},
+            {"name": "bun", "full_name": "oven-sh/bun/bun", "tap": "oven-sh/bun"},
+        ]}
+        with patch.object(module, "brew", return_value=json.dumps(payload)) as native:
+            infos = module.requested_formulae(["homebrew/core/aria2", "bun"])
+            self.assertEqual([(x["name"], x["tap"]) for x in infos],
+                             [("aria2", "homebrew/core"), ("bun", "oven-sh/bun")])
+            native.assert_called_once_with(
+                "info", "--json=v2", "--formula", "homebrew/core/aria2", "bun"
+            )
+
+    def test_unqualified_third_party_uses_native_brew(self):
+        with (
+            patch.object(module, "requested_formulae",
+                         return_value=[{"name": "bun", "tap": "oven-sh/bun"}]) as inspect,
+            patch.object(module, "passthrough", return_value=18) as native,
+            patch.object(module, "install") as own,
+            patch.object(module, "dispatch_build") as remote,
+        ):
+            self.assertEqual(module.main(["install", "--dry-run", "bun"]), 18)
+            inspect.assert_called_once_with(["bun"])
+            native.assert_called_once_with(["install", "--dry-run", "oven-sh/bun/bun"])
+            own.assert_not_called()
+            remote.assert_not_called()
+
+    def test_explicit_third_party_is_native_even_if_not_tapped(self):
+        args = ["install", "oven-sh/bun/bun"]
+        with (
+            patch.object(module, "requested_formulae") as lookup,
+            patch.object(module, "passthrough", return_value=12) as native,
+            patch.object(module, "install") as own,
+        ):
+            self.assertEqual(module.main(args), 12)
+            lookup.assert_not_called()  # brew install may auto-tap.
+            native.assert_called_once_with(args)
+            own.assert_not_called()
+
+    def test_mixed_explicit_tap_and_unqualified_tap_are_normalized(self):
+        args = ["install", "--dry-run", "oven-sh/bun/bun", "tunnel-client"]
+        roots = [{"name": "tunnel-client", "tap": "openai/tools",
+                  "full_name": "openai/tools/tunnel-client"}]
+        with (
+            patch.object(module, "requested_formulae", return_value=roots) as lookup,
+            patch.object(module, "passthrough", return_value=4) as native,
+            patch.object(module, "install") as own,
+        ):
+            self.assertEqual(module.main(args), 4)
+            lookup.assert_called_once_with(["tunnel-client"])
+            native.assert_called_once_with([
+                "install", "--dry-run", "oven-sh/bun/bun", "openai/tools/tunnel-client"
+            ])
+            own.assert_not_called()
+
+    def test_mixed_core_and_unqualified_third_party_is_native_batch(self):
+        roots = [
+            {"name": "aria2", "tap": "homebrew/core"},
+            {"name": "bun", "tap": "oven-sh/bun"},
+        ]
+        with (
+            patch.object(module, "requested_formulae", return_value=roots),
+            patch.object(module, "passthrough", return_value=16) as native,
+            patch.object(module, "install") as own,
+        ):
+            self.assertEqual(module.main(["install", "aria2", "bun"]), 16)
+            native.assert_called_once_with(["install", "aria2", "oven-sh/bun/bun"])
+            own.assert_not_called()
+
+    def test_core_formula_uses_planner_and_qualified_name_normalized(self):
+        with (
+            patch.object(module, "requested_formulae",
+                         return_value=[{"name": "aria2", "tap": "homebrew/core"}]),
+            patch.object(module, "install", return_value=24) as own,
+            patch.object(module, "passthrough") as native,
+        ):
+            self.assertEqual(module.main(
+                ["install", "--dry-run", "homebrew/core/aria2"]
+            ), 24)
+            own.assert_called_once_with(["aria2"], dry_run=True, yes=False)
+            native.assert_not_called()
+
+    def test_core_with_noncore_dependency_uses_native_brew(self):
+        with (
+            patch.object(module, "requested_formulae",
+                         return_value=[{"name": "aria2", "tap": "homebrew/core"}]),
+            patch.object(module, "install", side_effect=module.ThirdPartyDependency(
+                "aria2 requires vendor/tap/libfoo"
+            )),
+            patch.object(module, "passthrough", return_value=20) as native,
+        ):
+            self.assertEqual(module.main(["install", "aria2"]), 20)
+            native.assert_called_once_with(["install", "aria2"])
+
+    def test_core_dependency_full_name_is_preserved_or_rejected(self):
+        with patch.object(module, "brew", return_value="homebrew/core/zlib\n"):
+            self.assertEqual(module.dependencies("aria2"), ["zlib"])
+        with patch.object(module, "brew", return_value="vendor/tap/libfoo\n"):
+            with self.assertRaisesRegex(module.ThirdPartyDependency, "vendor/tap/libfoo"):
+                module.dependencies("aria2")
+
+    def test_dependency_tap_is_checked_before_release_planning(self):
+        infos = {
+            "aria2": {"name": "aria2", "tap": "homebrew/core"},
+            "libfoo": {"name": "libfoo", "tap": "vendor/tap"},
+        }
+        with (
+            patch.object(module, "dependencies", return_value=["libfoo"]),
+            patch.object(module, "brew", return_value="/usr/local/Cellar"),
+            patch.object(module, "formula_infos", return_value=infos),
+            patch.object(module, "all_installed_versions") as installed,
+        ):
+            catalog = module.ReleaseCatalog("sequoia")
+            with (
+                patch.object(catalog, "find") as lookup,
+                self.assertRaisesRegex(module.ThirdPartyDependency, "vendor/tap"),
+            ):
+                module.installation_plan(["aria2"], "sequoia", catalog)
+            installed.assert_not_called()
+            lookup.assert_not_called()
+
+    def test_explicit_build_rejects_third_party_root(self):
+        with (
+            patch.object(module, "formula_info",
+                         return_value={"name": "bun", "tap": "oven-sh/bun"}),
+            patch.object(module, "dependencies") as deps,
+            patch.object(module, "dispatch_build") as remote,
+        ):
+            with self.assertRaisesRegex(module.BottleError, "third-party"):
+                module.trigger_build(["bun"])
+            deps.assert_not_called()
+            remote.assert_not_called()
+
+    def test_explicit_build_rejects_third_party_dependency(self):
+        with (
+            patch.object(module, "formula_info",
+                         return_value={"name": "aria2", "tap": "homebrew/core"}),
+            patch.object(module, "dependencies", return_value=["libfoo"]),
+            patch.object(module, "formula_infos", return_value={
+                "libfoo": {"name": "libfoo", "tap": "vendor/tap"}
+            }),
+            patch.object(module, "dispatch_build") as remote,
+        ):
+            with self.assertRaisesRegex(module.BottleError, "not eligible"):
+                module.trigger_build(["aria2"])
+            remote.assert_not_called()
+
+    def test_third_party_status_is_native_only(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        with (
+            patch.object(module, "formula_info", return_value={
+                "name": "bun", "tap": "oven-sh/bun", "full_name": "oven-sh/bun/bun",
+                "versions": {"stable": "1.4.3"},
+            }),
+            patch.object(module, "check_platform") as platform,
+            patch.object(module, "github_api") as cloud,
+        ):
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(module.main(["status", "bun"]), 0)
+            self.assertIn("oven-sh/bun/bun", output.getvalue())
+            self.assertIn("native Homebrew", output.getvalue())
+            platform.assert_not_called()
+            cloud.assert_not_called()
 
 
 if __name__ == "__main__":

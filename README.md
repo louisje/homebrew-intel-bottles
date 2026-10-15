@@ -52,11 +52,23 @@ To disable the alias in the current shell:
 
 The alias only affects interactive Bash by default. Existing Bash sessions need to source ~/.bash_aliases.d/brew.alias or start a new shell after updating the alias. Scripts, direct /usr/local/bin/brew invocations, and other shells are not transparently intercepted.
 
+### Third-party Tap policy
+
+**Only `homebrew/core` Formulae use the Intel Bottle fallback and cloud builder.** Third-party Tap Formulae always use native Homebrew, which decides whether to pour the Tap's own Bottle or build locally from source. This applies to both `brew install oven-sh/bun/bun` and the unqualified `brew install bun`: the helper resolves the Tap and forwards `bun` as `oven-sh/bun/bun` to avoid choosing a conflicting `homebrew/core/bun` formula. Explicit third-party references are sent straight to native Homebrew even if their Tap is not yet installed (Homebrew can auto-tap).
+
+If a single `brew install` invocation mixes Core and third-party Formulae, **the entire batch is forwarded to native Homebrew** (including any Core dependencies). Similarly, Core Formulae whose dependency graph contains a third-party Formula fall back to native Homebrew. In these situations native Homebrew may compile from source locally; the extension prints a notice but never dispatches these third-party builds to GitHub Actions. To keep Core Formulae on the cloud Bottle path, install them separately. An explicit `brew intel-bottle build bun` is rejected when `bun` resolves to a third-party Tap.
+
+    brew install aria2                       # homebrew/core -> Intel Bottle planner
+    brew install bun                         # resolves -> native brew install oven-sh/bun/bun
+    brew install oven-sh/bun/bun              # third-party -> native Homebrew
+    brew install aria2 bun                   # mixed -> native Homebrew for both
+    brew intel-bottle status bun             # shows Tap ownership; no cloud build
+
 Cloud jobs queries use the repository's GitHub Actions API. By default only queued, waiting, and in-progress Formula jobs are shown. With --all, active jobs plus jobs from up to 20 recent completed workflow runs are displayed (within the latest 100 workflow runs returned by GitHub). Older jobs without version metadata are labelled *version unverified*.
 
 ### Bottle selection and safety
 
-For plain formula names passed to install:
+For `homebrew/core` Formulae passed to install:
 
 1. Resolve current Formula versions **including revisions** and recursive required/recommended dependencies through Homebrew. A bulk JSON query reduces repeated Homebrew startup overhead.
 2. Keep installed dependencies instead of silently upgrading/downgrading them, even if the current Formula version differs. Homebrew still performs its own installation/linkage checks.

@@ -20,10 +20,19 @@ from typing import Any
 REPO = os.environ.get("INTEL_BOTTLE_REPO", "louisje/homebrew-intel-bottles")
 REAL_BREW = os.environ.get("INTEL_BOTTLE_BREW", "/usr/local/bin/brew")
 FORMULA_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9@+_.-]*$")
+TAPPED_FORMULA_PATTERN = re.compile(
+    r"^[a-zA-Z0-9][a-zA-Z0-9@+_.-]*/[a-zA-Z0-9][a-zA-Z0-9@+_.-]*/[a-zA-Z0-9][a-zA-Z0-9@+_.-]*$"
+)
+CORE_TAP = "homebrew/core"
 MACOS_TAGS = {13: "ventura", 14: "sonoma", 15: "sequoia", 16: "tahoe"}
 
 
 class BottleError(RuntimeError):
+    pass
+
+
+class ThirdPartyDependency(BottleError):
+    """A core formula depends on a non-core tap; install via native brew."""
     pass
 
 
@@ -76,6 +85,43 @@ def formula_infos(names: list[str]) -> dict[str, dict[str, Any]]:
     if missing:
         raise BottleError("could not resolve formulae: " + ", ".join(sorted(missing)))
     return info
+
+
+def requested_formulae(names: list[str]) -> list[dict[str, Any]]:
+    """Resolve user inputs to their actual taps in one Homebrew metadata query."""
+    data = json.loads(brew("info", "--json=v2", "--formula", *names))
+    formulae = data.get("formulae", [])
+    resolved: list[dict[str, Any]] = []
+    for name in names:
+        parts = name.split("/")
+        basename = parts[-1]
+        expected_tap = "/".join(parts[:2]) if len(parts) == 3 else None
+        candidate = next(
+            (f for f in formulae if f.get("name") == basename
+             and (expected_tap is None or f.get("tap") == expected_tap)),
+            None,
+        )
+        if candidate is None:
+            raise BottleError("could not resolve formula and tap: " + name)
+        if not candidate.get("tap"):
+            raise BottleError("missing Tap identity for: " + name)
+        resolved.append(candidate)
+    return resolved
+
+
+def native_tap_install_args(
+    rest: list[str], names: list[str], roots: list[dict[str, Any]]
+) -> list[str]:
+    """Qualify third-party short names to avoid Homebrew/core collisions."""
+    qualified: dict[str, str] = {}
+    for requested, info in zip(names, roots):
+        if info["tap"] == CORE_TAP:
+            continue
+        full_name = info.get("full_name") or f"{info['tap']}/{info['name']}"
+        if not TAPPED_FORMULA_PATTERN.fullmatch(full_name):
+            raise BottleError(f"unsafe resolved third-party formula: {full_name}")
+        qualified[requested] = full_name
+    return ["install", *(qualified.get(arg, arg) for arg in rest)]
 
 
 def all_installed_versions() -> dict[str, list[str]]:
@@ -210,7 +256,19 @@ def validate_formula(name: str) -> None:
 def dependencies(name: str) -> list[str]:
     # brew deps --topological includes transitive required and recommended deps.
     values = brew("deps", "--topological", "--formula", name).splitlines()
-    return [x.split("/")[-1] for x in values if x.strip()]
+    result: list[str] = []
+    for value in values:
+        value = value.strip()
+        if not value:
+            continue
+        if "/" in value:
+            if not value.startswith(CORE_TAP + "/"):
+                raise ThirdPartyDependency(
+                    f"{name} requires third-party dependency {value}"
+                )
+            value = value.rsplit("/", 1)[-1]
+        result.append(value)
+    return result
 
 
 @dataclass
@@ -231,6 +289,11 @@ def installation_plan(names: list[str], tag: str, catalog: ReleaseCatalog) -> li
     queue = list(dict.fromkeys(queue))
     cellar = brew("--cellar")
     infos = formula_infos(queue)
+    for name, info in infos.items():
+        if info.get("tap") != CORE_TAP:
+            raise ThirdPartyDependency(
+                f"dependency {name} belongs to {info.get('tap') or 'unknown Tap'}"
+            )
     installed_map = all_installed_versions()
     actions: list[Planned] = []
     for name in queue:
@@ -508,7 +571,22 @@ def trigger_build(names: list[str], *, force: bool = False) -> int:
     candidates: list[Planned] = []
     for name in dict.fromkeys(names):
         validate_formula(name)
-        candidates.append(Planned(name, stable_version(formula_info(name)), "missing"))
+        info = formula_info(name)
+        if info.get("tap") != CORE_TAP:
+            raise BottleError(
+                f"{name} belongs to {info.get('tap') or 'unknown Tap'}; "
+                "third-party formulas must be built/installed locally with native brew"
+            )
+        deps = dependencies(name)
+        if deps:
+            dep_infos = formula_infos(deps)
+            for dep, dep_info in dep_infos.items():
+                if dep_info.get("tap") != CORE_TAP:
+                    raise BottleError(
+                        f"{name} depends on {dep} from {dep_info.get('tap')}; "
+                        "not eligible for Intel Bottle cloud build"
+                    )
+        candidates.append(Planned(name, stable_version(info), "missing"))
     if not force:
         candidates, _ = show_cloud_jobs(candidates, WorkflowCatalog())
     if not candidates:
@@ -611,6 +689,11 @@ Original Homebrew commands (forwarded unchanged):
   --version                   Show Homebrew version.
 
 Other Homebrew commands and options are passed through unchanged.
+Third-party Tap Formulae (qualified or unqualified) are installed by native
+Homebrew, with its own Bottle/source policy; they are NEVER sent to Intel
+Bottle cloud builds. Mixed core/third-party install batches are entirely
+delegated to native Homebrew. Core formulae with third-party dependencies
+also fall back to native Homebrew.
 Note: install with Casks, --HEAD, or other unsupported options is also
 forwarded to Homebrew; it does NOT use Intel Bottle safety checks.
 For full native Homebrew help: command brew --help
@@ -639,12 +722,18 @@ def main(args: list[str]) -> int:
         force = "--force" in rest
         return trigger_build([name for name in rest if name != "--force"], force=force)
     if cmd == "status":
-        if len(rest) != 1:
+        if len(rest) != 1 or not (
+            FORMULA_PATTERN.fullmatch(rest[0]) or TAPPED_FORMULA_PATTERN.fullmatch(rest[0])
+        ):
             raise BottleError("usage: brew intel-bottle status FORMULA")
-        validate_formula(rest[0])
-        tag = check_platform()
         info = formula_info(rest[0])
         version = stable_version(info)
+        if info.get("tap") != CORE_TAP:
+            print(f"{info.get('full_name') or rest[0]} {version}")
+            print("  Third-party Tap: native Homebrew handles installation and dependencies")
+            print("  Intel Bottle cloud builds: not used")
+            return 0
+        tag = check_platform()
         print(rest[0] + " " + version + " (" + tag + ")")
         print("  Homebrew official bottle:", "available" if official_bottle(info, tag) else "not available")
         hosted = ReleaseCatalog(tag).find(rest[0], version, brew("--cellar"))
@@ -668,11 +757,50 @@ def main(args: list[str]) -> int:
     if cmd == "install":
         dry_run, yes = "--dry-run" in rest, "--yes" in rest
         names = [x for x in rest if x not in {"--dry-run", "--yes"}]
-        if not names or any(not FORMULA_PATTERN.fullmatch(x) for x in names):
+        if not names or any(
+            not (FORMULA_PATTERN.fullmatch(name) or TAPPED_FORMULA_PATTERN.fullmatch(name))
+            for name in names
+        ):
+            # Non-plain forms (Casks, flags, URLs, etc.) retain native behavior.
             if dry_run or yes:
-                raise BottleError("--dry-run and --yes work only with plain formula names")
+                raise BottleError("--dry-run and --yes work only with Formula names")
             return passthrough(args)
-        return install(names, dry_run=dry_run, yes=yes)
+        # An explicit third-party reference can auto-tap on installation.
+        # Do not require brew info to work before the Tap has been added.
+        explicit_third_party = [
+            name for name in names
+            if TAPPED_FORMULA_PATTERN.fullmatch(name)
+            and not name.startswith(CORE_TAP + "/")
+        ]
+        if explicit_third_party:
+            message("third-party Tap formula(s): " + ", ".join(explicit_third_party))
+            # The fully qualified Formula may automatically add its Tap.
+            # Still qualify other short names, if their metadata is available.
+            shorts = [name for name in names if FORMULA_PATTERN.fullmatch(name)]
+            native_args = args
+            if shorts:
+                short_roots = requested_formulae(shorts)
+                native_args = native_tap_install_args(rest, shorts, short_roots)
+            message("delegating the entire install to native Homebrew")
+            return passthrough(native_args)
+        roots = requested_formulae(names)
+        third_party = [
+            f"{info['tap']}/{info['name']}"
+            for info in roots if info["tap"] != CORE_TAP
+        ]
+        if third_party:
+            # Keep mixed installs together. Native Homebrew also owns their
+            # dependencies, some of which could be compiled locally.
+            message("third-party Tap formula(s): " + ", ".join(third_party))
+            message("delegating the entire install to native Homebrew"
+                    + (" (including any homebrew/core formulae)" if len(third_party) != len(roots) else ""))
+            return passthrough(native_tap_install_args(rest, names, roots))
+        try:
+            return install([info["name"] for info in roots], dry_run=dry_run, yes=yes)
+        except ThirdPartyDependency as exc:
+            message(str(exc))
+            message("delegating the entire install to native Homebrew")
+            return passthrough(args)
     return passthrough(args)
 
 
