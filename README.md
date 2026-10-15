@@ -10,7 +10,7 @@ The GitHub repository name is homebrew-intel-bottles, so its short Homebrew tap 
     brew trust --command louisje/intel-bottles/intel-bottle
     brew intel-bottle help
 
-Homebrew commands not explicitly handled by the extension are forwarded to the real /usr/local/bin/brew.
+`brew intel-bottle` is a dedicated external command. It handles only its documented subcommands; other Homebrew commands belong to native `brew`. Within its `install` action, Casks and third-party Tap Formulae are deliberately delegated to native Homebrew.
 
     # Inspect which provider would be used:
     brew intel-bottle status protobuf
@@ -33,24 +33,30 @@ Homebrew commands not explicitly handled by the extension are forwarded to the r
     # Explicitly override duplicate protection if required:
     brew intel-bottle build --force llvm
 
-### Optional transparent Bash alias
+### Optional Bash function router (Outland)
 
-After validating the extension on your machine, **opt in**:
+The **Shell function** is the optional interactive convenience layer; the Python extension itself no longer impersonates all of Homebrew. On a machine with `~/outland` installed:
 
-    alias brew='brew intel-bottle'
+    ln -s ../outland/configs/func.d/brew.func ~/.bash_functions.d/brew.func
+    source ~/.bash_functions.d/brew.func
 
-With this alias, **brew --help, brew -h, brew help**, and **brew intel-bottle --help** all display the combined Intel Bottle help, including extensions (jobs, status, build, releases) and common native Homebrew commands that pass through unchanged. Native brew list, brew info, brew upgrade, brew uninstall, and brew --version continue unchanged; brew jobs is equivalent to brew intel-bottle jobs.
+The function is maintained in `~/outland/configs/func.d/brew.func`. Existing `~/.bashrc` configuration loads files from `~/.bash_functions.d` at shell startup. The previous `alias brew='brew intel-bottle'` must be removed, and the function automatically unaliases `brew` when sourced (for shells that had already loaded the old alias).
 
-To see the full original Homebrew help or bypass the alias:
+| User command | Route |
+| --- | --- |
+| `brew install aria2` | `brew intel-bottle install aria2` |
+| `brew install bun`, `brew install opencode-desktop` | Intel Bottle entrypoint resolves Cask/Tap and delegates to native Homebrew |
+| `brew install --cask foo`, `brew install --HEAD foo` | Native Homebrew (unsupported extension flags) |
+| `brew jobs`, `brew status aria2`, `brew build aria2`, `brew releases` | Intel Bottle external command |
+| `brew intel-bottle jobs` | Intel Bottle external command, **without double insertion** |
+| `brew info`, `brew list`, `brew upgrade`, `brew tap`, `brew --version` | Native Homebrew directly |
+| `brew --help` | Intel Bottle help **followed by** original Homebrew help |
+| `brew intel-bottle --help` | Intel Bottle help only |
+| `command brew --help` | Original Homebrew help only |
 
-    command brew --help
-    command brew list
+Native options like `brew install --cask`, `--formula`, `--HEAD`, `-v`, `-n` are not interpreted by the extension. To bypass the Bash function for any command, use `command brew ...`; to temporarily disable it, use `unset -f brew`.
 
-To disable the alias in the current shell:
-
-    unalias brew
-
-The alias only affects interactive Bash by default. Existing Bash sessions need to source ~/.bash_aliases.d/brew.alias or start a new shell after updating the alias. Scripts, direct /usr/local/bin/brew invocations, and other shells are not transparently intercepted.
+This wrapper affects only Bash sessions that source it; noninteractive scripts, other shells, and direct `/usr/local/bin/brew` invocations are unchanged.
 
 ### Cask and third-party Tap policy
 
@@ -83,7 +89,7 @@ For `homebrew/core` Formulae passed to install:
 
 --dry-run is read-only, --yes skips interactive confirmation of self-hosted bottles, and build explicitly requests a GitHub Actions job. Remote builds are asynchronous: output is available for installation only after the GitHub Release is published.
 
-Other install forms (casks, --HEAD, special build flags, etc.) are forwarded unchanged to Homebrew. For now, only Intel macOS 15 with the standard /usr/local prefix is supported by the self-hosted fallback. There is no automatic upgrade interception yet, and older bottle versions are rejected if they do not match the current Formula. The Bottle JSON's original upstream root_url does not control installation because the extension downloads local archives.
+Casks and third-party Tap Formulae are handed to native Homebrew during package resolution. Unsupported extension flags (`--HEAD`, `--cask`, `-v`, etc.) cause an explicit error in `brew intel-bottle install`, while the Bash wrapper sends regular `brew install` invocations with those flags straight to native Homebrew. For now, only Intel macOS 15 with the standard /usr/local prefix is supported by the self-hosted fallback. There is no automatic upgrade interception yet, and older bottle versions are rejected if they do not match the current Formula. The Bottle JSON's original upstream root_url does not control installation because the extension downloads local archives.
 
 ## Build and publish
 

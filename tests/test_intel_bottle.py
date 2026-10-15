@@ -18,16 +18,24 @@ loader.exec_module(module)
 
 
 class BottleTests(unittest.TestCase):
-    def test_passthrough_preserves_native_commands(self):
-        for args in (["list"], ["info", "llvm"], ["--version"], ["upgrade"]):
-            with self.subTest(args=args), patch.object(module, "passthrough", return_value=42) as native:
-                self.assertEqual(module.main(args), 42)
-                native.assert_called_once_with(args)
+    def test_rejects_non_extension_commands(self):
+        # A dedicated external command must never impersonate native brew.
+        for args in (["list"], ["info", "llvm"], ["--version"], ["upgrade"],
+                     ["intel-bottle", "list"], ["--proxy", "jobs"]):
+            with self.subTest(args=args), patch.object(module, "passthrough") as native:
+                with self.assertRaisesRegex(module.BottleError, "unknown intel-bottle command"):
+                    module.main(args)
+                native.assert_not_called()
 
-    def test_alias_with_explicit_command(self):
-        with patch.object(module, "passthrough", return_value=0) as native:
-            module.main(["intel-bottle", "list"])
-            native.assert_called_once_with(["list"])
+    def test_rejects_unsupported_explicit_install_options(self):
+        for args in (["install", "--cask", "opencode-desktop"],
+                     ["install", "--HEAD", "aria2"],
+                     ["install", "-v", "aria2"],
+                     ["install"]):
+            with self.subTest(args=args), patch.object(module, "passthrough") as native:
+                with self.assertRaisesRegex(module.BottleError, "usage: brew intel-bottle install"):
+                    module.main(args)
+                native.assert_not_called()
 
     def test_formula_validation(self):
         for invalid in ("a/b", "x;touch /tmp/pwned", "../x", "-v", ""):
@@ -239,42 +247,30 @@ class BottleTests(unittest.TestCase):
             dispatch.assert_not_called()
 
 
-    def test_alias_and_explicit_help_are_combined(self):
+    def test_extension_help_is_not_a_brew_proxy(self):
         from contextlib import redirect_stdout
         from io import StringIO
 
-        # Direct extension, aliased brew, and legacy proxy should all
-        # reveal the extensions AND forwarded native Homebrew commands.
         for args in ([], ["--help"], ["-h"], ["help"],
-                     ["intel-bottle", "--help"], ["intel-bottle", "-h"],
-                     ["--proxy", "--help"], ["--proxy", "help"],
-                     ["--proxy", "intel-bottle", "--help"]):
+                     ["install", "--help"], ["status", "-h"], ["build", "--help"]):
             with self.subTest(args=args), patch.object(module, "passthrough") as native:
                 out = StringIO()
                 with redirect_stdout(out):
                     self.assertEqual(module.main(args), 0)
                 help_text = out.getvalue()
-                for expected in ("brew intel-bottle", "jobs [--all]",
-                                 "status FORMULA", "build [--force]",
-                                 "Original Homebrew commands", "info [FORMULA|CASK...]",
-                                 "upgrade [FORMULA|CASK...]", "command brew --help"):
+                for expected in ("Usage: brew intel-bottle", "jobs [--all]",
+                                 "status FORMULA_OR_CASK", "build [--force]",
+                                 "install [--dry-run]"):
                     self.assertIn(expected, help_text)
+                self.assertNotIn("Original Homebrew commands", help_text)
                 native.assert_not_called()
 
-    def test_alias_forwards_native_commands_and_enables_jobs(self):
-        for args in (["info", "aria2"], ["--version"], ["outdated"],
-                     ["list"], ["upgrade"], ["doctor"]):
-            with self.subTest(args=args), patch.object(module, "passthrough", return_value=17) as native:
-                self.assertEqual(module.main(args), 17)
-                native.assert_called_once_with(args)
-        # Both current and old aliased shells accept the extension.
+    def test_extension_jobs_dispatch_without_alias(self):
         with patch.object(module, "parse_jobs_options", return_value=0) as jobs:
-            for args in (["jobs", "aria2"], ["intel-bottle", "jobs", "--all"],
-                         ["--proxy", "jobs", "aria2"],
-                         ["--proxy", "intel-bottle", "jobs", "--all"]):
-                with self.subTest(args=args):
-                    self.assertEqual(module.main(args), 0)
-            self.assertEqual(jobs.call_count, 4)
+            self.assertEqual(module.main(["jobs", "aria2"]), 0)
+            self.assertEqual(module.main(["jobs", "--all"]), 0)
+            self.assertEqual(jobs.call_count, 2)
+            self.assertEqual(jobs.call_args.args, (["--all"],))
 
     def test_jobs_filtered_active_vs_all(self):
         from contextlib import redirect_stdout
@@ -589,15 +585,16 @@ class BottleTests(unittest.TestCase):
             own.assert_not_called()
             cloud.assert_not_called()
 
-    def test_explicit_cask_flag_does_not_invoke_formula_lookup(self):
+    def test_explicit_cask_flag_is_not_a_native_brew_proxy(self):
         with (
             patch.object(module, "requested_packages") as inspect,
-            patch.object(module, "passthrough", return_value=0) as native,
+            patch.object(module, "passthrough") as native,
             patch.object(module, "install") as own,
         ):
             args = ["install", "--cask", "opencode-desktop"]
-            self.assertEqual(module.main(args), 0)
-            native.assert_called_once_with(args)
+            with self.assertRaisesRegex(module.BottleError, "native 'brew install'"):
+                module.main(args)
+            native.assert_not_called()
             inspect.assert_not_called()
             own.assert_not_called()
 

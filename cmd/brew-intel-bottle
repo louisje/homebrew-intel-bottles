@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Homebrew Intel bottle helper; all non-install commands pass through unchanged."""
+"""Dedicated Homebrew external command for verified Intel Bottle management."""
 from __future__ import annotations
 
 import hashlib
@@ -54,6 +54,7 @@ def brew(*args: str, capture: bool = True) -> str:
 
 
 def passthrough(args: list[str]) -> int:
+    """Native installer for Casks, third-party Taps, and mixed batches only."""
     return subprocess.call([REAL_BREW, *args])
 
 
@@ -672,67 +673,50 @@ def install(names: list[str], *, dry_run: bool = False, yes: bool = False) -> in
     return 0
 
 
-HELP = """Usage: brew <command> [options]
-       brew intel-bottle <command> [options]
+HELP = """Usage: brew intel-bottle <command> [options]
 
-Intel Bottle extensions (Intel macOS; Homebrew with Bottle fallback):
+Manage verified Intel Homebrew Bottles for homebrew/core Formulae:
   install [--dry-run] [--yes] FORMULA [...]
       Prefer official bottles, then verified Intel GitHub Release bottles.
       Missing bottles can be scheduled for cloud builds; never silently
-      compile missing source packages locally.
-  status FORMULA
-      Show official/self-hosted Bottle availability and cloud build status.
+      compile missing core source packages locally.
+  status FORMULA_OR_CASK
+      Show Bottle availability, Tap identity, and cloud build status.
   releases
       List recently published Intel Bottle releases.
   build [--force] FORMULA [...]
-      Request missing cloud builds (avoid duplicate active jobs).
+      Request missing homebrew/core cloud builds (avoid active duplicates).
       --force explicitly overrides duplicate protection.
   jobs [--all] [FORMULA]
-      List active cloud jobs. --all includes recent completed jobs;
-      optionally filter by Formula.
+      List active cloud jobs; --all includes recent completed jobs.
   help, -h, --help
-      Show this combined Intel Bottle and Homebrew compatibility help.
+      Show this Intel Bottle help.
 
-Original Homebrew commands (forwarded unchanged):
-  search TEXT|/REGEX/         Find Formulae and Casks.
-  info [FORMULA|CASK...]      Show package information.
-  list [FORMULA|CASK...]      List installed packages.
-  update                      Update Homebrew metadata.
-  upgrade [FORMULA|CASK...]   Upgrade installed packages (native Homebrew).
-  uninstall FORMULA|CASK...   Remove packages.
-  outdated                    List outdated packages.
-  doctor                      Diagnose Homebrew issues.
-  config                      Show Homebrew configuration.
-  --version                   Show Homebrew version.
-
-Other Homebrew commands and options are passed through unchanged.
-Casks and third-party Tap Formulae (qualified or unqualified) are installed
-by native Homebrew, with its own download/Bottle/source policy; they are
-NEVER sent to Intel Bottle cloud builds. Mixed Formula/Cask or core/third-
-party batches are entirely delegated to native Homebrew. Core Formulae with
-third-party dependencies also fall back to native Homebrew.
-Note: install with --HEAD or other unsupported options is also forwarded
-to Homebrew; it does NOT use Intel Bottle safety checks.
-For full native Homebrew help: command brew --help
-Transparent interactive Bash alias: alias brew='brew intel-bottle'
+Casks and third-party Tap Formulae are installed with native Homebrew.
+Mixed Formula/Cask or core/third-party batches are also delegated to native
+Homebrew; this can build source packages locally.
+For all other Homebrew commands, use 'brew COMMAND' directly.
+The optional Bash function wrapper in ~/outland/configs/func.d/brew.func
+routes common subcommands and displays combined help for 'brew --help'.
 """
 
 
 def main(args: list[str]) -> int:
-    # An interactive alias expands brew --help into
-    # brew intel-bottle --help; both show the combined help.
-    # Accept the retired --proxy marker for existing sessions until reloaded.
-    if args and args[0] == "--proxy":
-        args = args[1:]
-    if args and args[0] == "intel-bottle":
-        args = args[1:]
+    # This is a dedicated Homebrew external command, never the top-level
+    # brew proxy. The optional Bash function decides which commands enter it.
     if not args:
         print(HELP)
         return 0
     cmd, *rest = args
     if cmd in {"help", "-h", "--help"}:
+        if rest:
+            raise BottleError("usage: brew intel-bottle --help")
         print(HELP)
         return 0
+    if cmd != "jobs" and rest in (["--help"], ["-h"]):
+        if cmd in {"install", "status", "build", "releases"}:
+            print(HELP)
+            return 0
     if cmd == "jobs":
         return parse_jobs_options(rest)
     if cmd == "build":
@@ -783,10 +767,10 @@ def main(args: list[str]) -> int:
             not (FORMULA_PATTERN.fullmatch(name) or TAPPED_FORMULA_PATTERN.fullmatch(name))
             for name in names
         ):
-            # Non-plain forms (Casks, flags, URLs, etc.) retain native behavior.
-            if dry_run or yes:
-                raise BottleError("--dry-run and --yes work only with Formula names")
-            return passthrough(args)
+            raise BottleError(
+                "usage: brew intel-bottle install [--dry-run] [--yes] FORMULA [...]; "
+                "use native 'brew install' for other Homebrew flags"
+            )
         # An explicit third-party reference can auto-tap on installation.
         # Do not require brew info to work before the Tap has been added.
         explicit_third_party = [
@@ -828,7 +812,10 @@ def main(args: list[str]) -> int:
             message(str(exc))
             message("delegating the entire install to native Homebrew")
             return passthrough(args)
-    return passthrough(args)
+    raise BottleError(
+        f"unknown intel-bottle command: {cmd}; "
+        "use 'brew intel-bottle --help' for supported commands"
+    )
 
 
 if __name__ == "__main__":
