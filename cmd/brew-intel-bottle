@@ -87,22 +87,39 @@ def formula_infos(names: list[str]) -> dict[str, dict[str, Any]]:
     return info
 
 
-def requested_formulae(names: list[str]) -> list[dict[str, Any]]:
-    """Resolve user inputs to their actual taps in one Homebrew metadata query."""
-    data = json.loads(brew("info", "--json=v2", "--formula", *names))
-    formulae = data.get("formulae", [])
+def requested_packages(names: list[str]) -> list[dict[str, Any]]:
+    """Resolve Formulae *and* Casks, including their Tap ownership, in one query.
+
+    brew info --json=v2 --formula rejects Casks. Without that flag Homebrew
+    returns both kinds, in separate "formulae" and "casks" arrays.
+    """
+    data = json.loads(brew("info", "--json=v2", *names))
+    candidates = [
+        {**formula, "kind": "formula"}
+        for formula in data.get("formulae", [])
+    ]
+    candidates.extend(
+        {
+            "name": cask["token"],
+            "tap": cask.get("tap"),
+            "full_name": cask.get("full_token") or cask["token"],
+            "kind": "cask",
+        }
+        for cask in data.get("casks", [])
+    )
     resolved: list[dict[str, Any]] = []
     for name in names:
         parts = name.split("/")
         basename = parts[-1]
         expected_tap = "/".join(parts[:2]) if len(parts) == 3 else None
         candidate = next(
-            (f for f in formulae if f.get("name") == basename
-             and (expected_tap is None or f.get("tap") == expected_tap)),
+            (item for item in candidates
+             if item.get("name") == basename
+             and (expected_tap is None or item.get("tap") == expected_tap)),
             None,
         )
         if candidate is None:
-            raise BottleError("could not resolve formula and tap: " + name)
+            raise BottleError("could not resolve Formula/Cask and Tap: " + name)
         if not candidate.get("tap"):
             raise BottleError("missing Tap identity for: " + name)
         resolved.append(candidate)
@@ -112,14 +129,14 @@ def requested_formulae(names: list[str]) -> list[dict[str, Any]]:
 def native_tap_install_args(
     rest: list[str], names: list[str], roots: list[dict[str, Any]]
 ) -> list[str]:
-    """Qualify third-party short names to avoid Homebrew/core collisions."""
+    """Qualify third-party short names, for both Formulae and Casks."""
     qualified: dict[str, str] = {}
     for requested, info in zip(names, roots):
-        if info["tap"] == CORE_TAP:
+        if info["tap"] in {CORE_TAP, "homebrew/cask"}:
             continue
         full_name = info.get("full_name") or f"{info['tap']}/{info['name']}"
         if not TAPPED_FORMULA_PATTERN.fullmatch(full_name):
-            raise BottleError(f"unsafe resolved third-party formula: {full_name}")
+            raise BottleError(f"unsafe resolved third-party package: {full_name}")
         qualified[requested] = full_name
     return ["install", *(qualified.get(arg, arg) for arg in rest)]
 
@@ -689,13 +706,13 @@ Original Homebrew commands (forwarded unchanged):
   --version                   Show Homebrew version.
 
 Other Homebrew commands and options are passed through unchanged.
-Third-party Tap Formulae (qualified or unqualified) are installed by native
-Homebrew, with its own Bottle/source policy; they are NEVER sent to Intel
-Bottle cloud builds. Mixed core/third-party install batches are entirely
-delegated to native Homebrew. Core formulae with third-party dependencies
-also fall back to native Homebrew.
-Note: install with Casks, --HEAD, or other unsupported options is also
-forwarded to Homebrew; it does NOT use Intel Bottle safety checks.
+Casks and third-party Tap Formulae (qualified or unqualified) are installed
+by native Homebrew, with its own download/Bottle/source policy; they are
+NEVER sent to Intel Bottle cloud builds. Mixed Formula/Cask or core/third-
+party batches are entirely delegated to native Homebrew. Core Formulae with
+third-party dependencies also fall back to native Homebrew.
+Note: install with --HEAD or other unsupported options is also forwarded
+to Homebrew; it does NOT use Intel Bottle safety checks.
 For full native Homebrew help: command brew --help
 Transparent interactive Bash alias: alias brew='brew intel-bottle'
 """
@@ -726,7 +743,12 @@ def main(args: list[str]) -> int:
             FORMULA_PATTERN.fullmatch(rest[0]) or TAPPED_FORMULA_PATTERN.fullmatch(rest[0])
         ):
             raise BottleError("usage: brew intel-bottle status FORMULA")
-        info = formula_info(rest[0])
+        info = requested_packages([rest[0]])[0]
+        if info.get("kind") == "cask":
+            print(f"{info.get('full_name') or rest[0]} (Cask)")
+            print("  Installation: native Homebrew")
+            print("  Intel Bottle cloud builds: not used")
+            return 0
         version = stable_version(info)
         if info.get("tap") != CORE_TAP:
             print(f"{info.get('full_name') or rest[0]} {version}")
@@ -779,21 +801,26 @@ def main(args: list[str]) -> int:
             shorts = [name for name in names if FORMULA_PATTERN.fullmatch(name)]
             native_args = args
             if shorts:
-                short_roots = requested_formulae(shorts)
+                short_roots = requested_packages(shorts)
                 native_args = native_tap_install_args(rest, shorts, short_roots)
             message("delegating the entire install to native Homebrew")
             return passthrough(native_args)
-        roots = requested_formulae(names)
-        third_party = [
-            f"{info['tap']}/{info['name']}"
-            for info in roots if info["tap"] != CORE_TAP
+        roots = requested_packages(names)
+        native_only = [
+            info for info in roots
+            if info.get("kind", "formula") == "cask" or info["tap"] != CORE_TAP
         ]
-        if third_party:
-            # Keep mixed installs together. Native Homebrew also owns their
-            # dependencies, some of which could be compiled locally.
-            message("third-party Tap formula(s): " + ", ".join(third_party))
+        if native_only:
+            # Native Homebrew handles all Casks and third-party Formulae,
+            # preserving their original install semantics and dependencies.
+            details = [
+                (info.get("full_name") or f"{info['tap']}/{info['name']}")
+                + (" [Cask]" if info.get("kind") == "cask" else " [third-party Formula]")
+                for info in native_only
+            ]
+            message("native Homebrew package(s): " + ", ".join(details))
             message("delegating the entire install to native Homebrew"
-                    + (" (including any homebrew/core formulae)" if len(third_party) != len(roots) else ""))
+                    + (" (including any homebrew/core Formulae)" if len(native_only) != len(roots) else ""))
             return passthrough(native_tap_install_args(rest, names, roots))
         try:
             return install([info["name"] for info in roots], dry_run=dry_run, yes=yes)

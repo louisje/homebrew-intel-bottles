@@ -348,16 +348,16 @@ class BottleTests(unittest.TestCase):
             {"name": "bun", "full_name": "oven-sh/bun/bun", "tap": "oven-sh/bun"},
         ]}
         with patch.object(module, "brew", return_value=json.dumps(payload)) as native:
-            infos = module.requested_formulae(["homebrew/core/aria2", "bun"])
+            infos = module.requested_packages(["homebrew/core/aria2", "bun"])
             self.assertEqual([(x["name"], x["tap"]) for x in infos],
                              [("aria2", "homebrew/core"), ("bun", "oven-sh/bun")])
             native.assert_called_once_with(
-                "info", "--json=v2", "--formula", "homebrew/core/aria2", "bun"
+                "info", "--json=v2", "homebrew/core/aria2", "bun"
             )
 
     def test_unqualified_third_party_uses_native_brew(self):
         with (
-            patch.object(module, "requested_formulae",
+            patch.object(module, "requested_packages",
                          return_value=[{"name": "bun", "tap": "oven-sh/bun"}]) as inspect,
             patch.object(module, "passthrough", return_value=18) as native,
             patch.object(module, "install") as own,
@@ -372,7 +372,7 @@ class BottleTests(unittest.TestCase):
     def test_explicit_third_party_is_native_even_if_not_tapped(self):
         args = ["install", "oven-sh/bun/bun"]
         with (
-            patch.object(module, "requested_formulae") as lookup,
+            patch.object(module, "requested_packages") as lookup,
             patch.object(module, "passthrough", return_value=12) as native,
             patch.object(module, "install") as own,
         ):
@@ -386,7 +386,7 @@ class BottleTests(unittest.TestCase):
         roots = [{"name": "tunnel-client", "tap": "openai/tools",
                   "full_name": "openai/tools/tunnel-client"}]
         with (
-            patch.object(module, "requested_formulae", return_value=roots) as lookup,
+            patch.object(module, "requested_packages", return_value=roots) as lookup,
             patch.object(module, "passthrough", return_value=4) as native,
             patch.object(module, "install") as own,
         ):
@@ -403,7 +403,7 @@ class BottleTests(unittest.TestCase):
             {"name": "bun", "tap": "oven-sh/bun"},
         ]
         with (
-            patch.object(module, "requested_formulae", return_value=roots),
+            patch.object(module, "requested_packages", return_value=roots),
             patch.object(module, "passthrough", return_value=16) as native,
             patch.object(module, "install") as own,
         ):
@@ -413,7 +413,7 @@ class BottleTests(unittest.TestCase):
 
     def test_core_formula_uses_planner_and_qualified_name_normalized(self):
         with (
-            patch.object(module, "requested_formulae",
+            patch.object(module, "requested_packages",
                          return_value=[{"name": "aria2", "tap": "homebrew/core"}]),
             patch.object(module, "install", return_value=24) as own,
             patch.object(module, "passthrough") as native,
@@ -426,7 +426,7 @@ class BottleTests(unittest.TestCase):
 
     def test_core_with_noncore_dependency_uses_native_brew(self):
         with (
-            patch.object(module, "requested_formulae",
+            patch.object(module, "requested_packages",
                          return_value=[{"name": "aria2", "tap": "homebrew/core"}]),
             patch.object(module, "install", side_effect=module.ThirdPartyDependency(
                 "aria2 requires vendor/tap/libfoo"
@@ -493,10 +493,10 @@ class BottleTests(unittest.TestCase):
         from contextlib import redirect_stdout
         from io import StringIO
         with (
-            patch.object(module, "formula_info", return_value={
+            patch.object(module, "requested_packages", return_value=[{
                 "name": "bun", "tap": "oven-sh/bun", "full_name": "oven-sh/bun/bun",
-                "versions": {"stable": "1.4.3"},
-            }),
+                "kind": "formula", "versions": {"stable": "1.4.3"},
+            }]),
             patch.object(module, "check_platform") as platform,
             patch.object(module, "github_api") as cloud,
         ):
@@ -505,6 +505,136 @@ class BottleTests(unittest.TestCase):
                 self.assertEqual(module.main(["status", "bun"]), 0)
             self.assertIn("oven-sh/bun/bun", output.getvalue())
             self.assertIn("native Homebrew", output.getvalue())
+            platform.assert_not_called()
+            cloud.assert_not_called()
+
+
+    def test_cask_metadata_and_tap_resolution(self):
+        payload = {
+            "formulae": [],
+            "casks": [
+                {"token": "opencode-desktop", "full_token": "opencode-desktop",
+                 "tap": "homebrew/cask", "version": "2.0.29"},
+                {"token": "claude-code-history-viewer",
+                 "full_token": "jhlee0409/tap/claude-code-history-viewer",
+                 "tap": "jhlee0409/tap", "version": "1.32.0"},
+            ],
+        }
+        with patch.object(module, "brew", return_value=json.dumps(payload)) as native:
+            roots = module.requested_packages([
+                "opencode-desktop", "claude-code-history-viewer"
+            ])
+            self.assertEqual(
+                [(x["name"], x["tap"], x["kind"]) for x in roots],
+                [
+                    ("opencode-desktop", "homebrew/cask", "cask"),
+                    ("claude-code-history-viewer", "jhlee0409/tap", "cask"),
+                ],
+            )
+            native.assert_called_once_with(
+                "info", "--json=v2", "opencode-desktop", "claude-code-history-viewer"
+            )
+            self.assertEqual(
+                module.native_tap_install_args(
+                    ["--dry-run", "opencode-desktop", "claude-code-history-viewer"],
+                    ["opencode-desktop", "claude-code-history-viewer"],
+                    roots,
+                ),
+                ["install", "--dry-run", "opencode-desktop",
+                 "jhlee0409/tap/claude-code-history-viewer"],
+            )
+
+    def test_two_casks_entire_batch_native_never_cloud(self):
+        casks = [
+            {"name": "opencode-desktop", "tap": "homebrew/cask",
+             "full_name": "opencode-desktop", "kind": "cask"},
+            {"name": "claude-code-history-viewer", "tap": "jhlee0409/tap",
+             "full_name": "jhlee0409/tap/claude-code-history-viewer",
+             "kind": "cask"},
+        ]
+        with (
+            patch.object(module, "requested_packages", return_value=casks) as inspect,
+            patch.object(module, "passthrough", return_value=0) as native,
+            patch.object(module, "install") as own,
+            patch.object(module, "dispatch_build") as cloud,
+        ):
+            args = ["install", "opencode-desktop", "claude-code-history-viewer"]
+            self.assertEqual(module.main(args), 0)
+            inspect.assert_called_once_with(args[1:])
+            native.assert_called_once_with([
+                "install", "opencode-desktop",
+                "jhlee0409/tap/claude-code-history-viewer",
+            ])
+            own.assert_not_called()
+            cloud.assert_not_called()
+
+    def test_mixed_formula_and_cask_batch_native(self):
+        items = [
+            {"name": "aria2", "tap": "homebrew/core", "kind": "formula"},
+            {"name": "opencode-desktop", "tap": "homebrew/cask",
+             "full_name": "opencode-desktop", "kind": "cask"},
+        ]
+        with (
+            patch.object(module, "requested_packages", return_value=items),
+            patch.object(module, "passthrough", return_value=0) as native,
+            patch.object(module, "install") as own,
+            patch.object(module, "dispatch_build") as cloud,
+        ):
+            self.assertEqual(
+                module.main(["install", "--dry-run", "aria2", "opencode-desktop"]), 0
+            )
+            native.assert_called_once_with(
+                ["install", "--dry-run", "aria2", "opencode-desktop"]
+            )
+            own.assert_not_called()
+            cloud.assert_not_called()
+
+    def test_explicit_cask_flag_does_not_invoke_formula_lookup(self):
+        with (
+            patch.object(module, "requested_packages") as inspect,
+            patch.object(module, "passthrough", return_value=0) as native,
+            patch.object(module, "install") as own,
+        ):
+            args = ["install", "--cask", "opencode-desktop"]
+            self.assertEqual(module.main(args), 0)
+            native.assert_called_once_with(args)
+            inspect.assert_not_called()
+            own.assert_not_called()
+
+    def test_explicit_third_party_with_short_cask_stays_native(self):
+        resolved_casks = [
+            {"name": "opencode-desktop", "tap": "homebrew/cask",
+             "full_name": "opencode-desktop", "kind": "cask"}
+        ]
+        with (
+            patch.object(module, "requested_packages", return_value=resolved_casks),
+            patch.object(module, "passthrough", return_value=0) as native,
+            patch.object(module, "install") as own,
+        ):
+            args = ["install", "oven-sh/bun/bun", "opencode-desktop"]
+            self.assertEqual(module.main(args), 0)
+            native.assert_called_once_with(args)
+            own.assert_not_called()
+
+
+    def test_cask_status_reports_native_only(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        with (
+            patch.object(module, "requested_packages", return_value=[{
+                "name": "opencode-desktop",
+                "full_name": "opencode-desktop",
+                "tap": "homebrew/cask", "kind": "cask",
+            }]),
+            patch.object(module, "check_platform") as platform,
+            patch.object(module, "github_api") as cloud,
+        ):
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(module.main(["status", "opencode-desktop"]), 0)
+            self.assertIn("opencode-desktop (Cask)", output.getvalue())
+            self.assertIn("native Homebrew", output.getvalue())
+            self.assertIn("cloud builds: not used", output.getvalue())
             platform.assert_not_called()
             cloud.assert_not_called()
 
