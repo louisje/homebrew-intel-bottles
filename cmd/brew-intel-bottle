@@ -73,7 +73,10 @@ def stable_version(info: dict[str, Any]) -> str:
     value = (info.get("versions") or {}).get("stable")
     if not value:
         raise BottleError("no stable version for " + info["name"])
-    return str(value)
+    # Homebrew's pkg_version includes the Formula revision, which is separate
+    # from versions.stable in brew info --json=v2 (e.g. aria2 1.37.0_3).
+    revision = int(info.get("revision") or 0)
+    return str(value) + ("_" + str(revision) if revision else "")
 
 
 def official_bottle(info: dict[str, Any], tag: str) -> bool:
@@ -218,10 +221,11 @@ def installation_plan(names: list[str], tag: str, catalog: ReleaseCatalog) -> li
             actions.append(Planned(name, version, "installed"))
             continue
         if installed and name not in names:
-            raise BottleError(
-                name + " has another installed version (" + ", ".join(installed)
-                + "); refusing to upgrade dependency silently"
-            )
+            # Existing dependencies must not be forcibly downgraded or
+            # upgraded here. Leave their compatibility checks to Homebrew.
+            # A Formula can legitimately be older than the installed version.
+            actions.append(Planned(name, ", ".join(installed), "installed"))
+            continue
         if official_bottle(info, tag):
             actions.append(Planned(name, version, "official"))
             continue

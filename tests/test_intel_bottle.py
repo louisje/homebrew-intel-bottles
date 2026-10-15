@@ -35,6 +35,28 @@ class BottleTests(unittest.TestCase):
                 module.validate_formula(invalid)
         module.validate_formula("llvm@21")
 
+    def test_revision_is_part_of_bottle_version(self):
+        self.assertEqual(module.stable_version({"name": "aria2", "versions": {"stable": "1.37.0"}, "revision": 3}), "1.37.0_3")
+        self.assertEqual(module.stable_version({"name": "protobuf", "versions": {"stable": "36.2"}, "revision": 0}), "36.2")
+
+    def test_installed_dependency_with_different_version_is_preserved(self):
+        def info(name):
+            return {"name": name, "versions": {"stable": "3.5.9" if name == "openssl@3" else "1.37.0"},
+                    "revision": 3 if name == "aria2" else 0, "bottle": {}}
+        with (
+            patch.object(module, "dependencies", return_value=["openssl@3"]),
+            patch.object(module, "brew", return_value="/usr/local/Cellar"),
+            patch.object(module, "formula_info", side_effect=info),
+            patch.object(module, "installed_versions", side_effect=lambda name: ["3.6.5"] if name == "openssl@3" else ["1.37.0_2"]),
+        ):
+            catalog = module.ReleaseCatalog("sequoia")
+            with patch.object(catalog, "find", return_value=None):
+                plan = module.installation_plan(["aria2"], "sequoia", catalog)
+            self.assertEqual([(x.name, x.version, x.source) for x in plan], [
+                ("openssl@3", "3.6.5", "installed"),
+                ("aria2", "1.37.0_3", "missing"),
+            ])
+
     def test_official_bottle(self):
         info = {"bottle": {"stable": {"files": {"sequoia": {"sha256": "xxx"}}}}}
         self.assertTrue(module.official_bottle(info, "sequoia"))
