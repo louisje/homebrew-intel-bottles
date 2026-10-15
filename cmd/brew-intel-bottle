@@ -69,6 +69,24 @@ def formula_info(name: str) -> dict[str, Any]:
     return formulae[0]
 
 
+def formula_infos(names: list[str]) -> dict[str, dict[str, Any]]:
+    data = json.loads(brew("info", "--json=v2", "--formula", *names))
+    info = {f["name"]: f for f in data.get("formulae", [])}
+    missing = set(names) - set(info)
+    if missing:
+        raise BottleError("could not resolve formulae: " + ", ".join(sorted(missing)))
+    return info
+
+
+def all_installed_versions() -> dict[str, list[str]]:
+    installed: dict[str, list[str]] = {}
+    for line in brew("list", "--versions", "--formula").splitlines():
+        parts = line.split()
+        if parts:
+            installed[parts[0]] = parts[1:]
+    return installed
+
+
 def stable_version(info: dict[str, Any]) -> str:
     value = (info.get("versions") or {}).get("stable")
     if not value:
@@ -212,11 +230,13 @@ def installation_plan(names: list[str], tag: str, catalog: ReleaseCatalog) -> li
     # Each dependency appears before its dependents; preserve order without duplicates.
     queue = list(dict.fromkeys(queue))
     cellar = brew("--cellar")
+    infos = formula_infos(queue)
+    installed_map = all_installed_versions()
     actions: list[Planned] = []
     for name in queue:
-        info = formula_info(name)
+        info = infos[name]
         version = stable_version(info)
-        installed = installed_versions(name)
+        installed = installed_map.get(name, [])
         if version in installed:
             actions.append(Planned(name, version, "installed"))
             continue
@@ -241,6 +261,157 @@ def print_plan(plan: list[Planned]) -> None:
         print("  {name} {version}: {label}".format(name=action.name, version=action.version, label=label))
         if action.bottle:
             print("    " + action.bottle.release_url)
+
+
+
+# The REST workflow-run resource does not expose workflow_dispatch inputs.
+# New runs advertise pinned versions in job names; older unversioned runs
+# are treated as potentially overlapping rather than incorrectly exact matches.
+JOB_NAME_PATTERN = re.compile(r"^([A-Za-z0-9@+_.-]+) \[([A-Za-z0-9.+_~-]*)\]$")
+RUN_NAME_PATTERN = re.compile(r"^Intel Bottles \[([^\]]+)\] versions=\[([^\]]*)\]$")
+ACTIVE_RUN_STATES = {"queued", "in_progress", "waiting", "requested", "pending"}
+
+
+@dataclass(frozen=True)
+class CloudJob:
+    name: str
+    version: str | None
+    status: str
+    conclusion: str | None
+    url: str
+    run_id: int
+    run_status: str
+
+    @property
+    def active(self) -> bool:
+        return self.status in ACTIVE_RUN_STATES or (
+            self.status == "completed" and self.conclusion == "success"
+            and self.run_status in ACTIVE_RUN_STATES
+        )
+
+
+class WorkflowCatalog:
+    """Find cloud jobs by Formula + revision, without assuming old run versions."""
+
+    def __init__(self) -> None:
+        self._jobs: list[CloudJob] | None = None
+
+    def all(self) -> list[CloudJob]:
+        if self._jobs is not None:
+            return self._jobs
+        result = github_api(
+            "repos/" + REPO + "/actions/workflows/build.yml/runs?per_page=100"
+        )
+        runs = result.get("workflow_runs", [])
+        if not isinstance(runs, list):
+            raise BottleError("unexpected workflow runs response")
+        all_jobs: list[CloudJob] = []
+        completed_scanned = 0
+        for run in runs:
+            run_status = str(run.get("status") or "")
+            is_active = run_status in ACTIVE_RUN_STATES
+            if not is_active:
+                if completed_scanned >= 3:
+                    continue
+                completed_scanned += 1
+            run_id = int(run["id"])
+            jobs = github_api(
+                "repos/" + REPO + "/actions/runs/" + str(run_id) + "/jobs?per_page=100"
+            ).get("jobs", [])
+            names_seen: set[str] = set()
+            for job in jobs:
+                name = str(job.get("name", ""))
+                found = JOB_NAME_PATTERN.fullmatch(name)
+                formula, version = (found.group(1), found.group(2) or None) if found else (name, None)
+                if not FORMULA_PATTERN.fullmatch(formula):
+                    continue
+                names_seen.add(formula)
+                all_jobs.append(CloudJob(
+                    name=formula, version=version,
+                    status=str(job.get("status") or ""),
+                    conclusion=job.get("conclusion"),
+                    url=str(job.get("html_url") or run.get("html_url") or ""),
+                    run_id=run_id, run_status=run_status,
+                ))
+            # Before jobs are created, infer requested versions from run-name.
+            title_match = RUN_NAME_PATTERN.fullmatch(str(run.get("display_title", "")))
+            if is_active and title_match:
+                requested_names = [n.strip() for n in title_match.group(1).split(",")]
+                pins = {}
+                for pair in title_match.group(2).split(","):
+                    if "=" in pair:
+                        n, v = pair.strip().split("=", 1)
+                        pins[n] = v
+                for name in requested_names:
+                    if FORMULA_PATTERN.fullmatch(name) and name not in names_seen:
+                        all_jobs.append(CloudJob(
+                            name=name, version=pins.get(name),
+                            status="queued", conclusion=None,
+                            url=str(run.get("html_url") or ""),
+                            run_id=run_id, run_status=run_status,
+                        ))
+        self._jobs = all_jobs
+        return all_jobs
+
+    def match(self, name: str, version: str) -> tuple[CloudJob | None, CloudJob | None]:
+        jobs = [job for job in self.all() if job.name == name]
+        # Strictly versioned jobs are preferred; unknown-version legacy jobs
+        # are not presumed to match, but prevent blind duplicates.
+        for job in jobs:
+            if job.active and job.version == version:
+                return job, None
+        for job in jobs:
+            if job.active and job.version is None:
+                return job, None
+        for job in jobs:
+            if job.version == version and job.conclusion in {"failure", "cancelled", "timed_out"}:
+                return None, job
+        return None, None
+
+
+def build_candidates(plan: list[Planned], requested: list[str]) -> list[Planned]:
+    """Dispatch only missing roots; the cloud root job also bottles dependencies."""
+    missing = {item.name: item for item in plan if item.source == "missing"}
+    if not missing:
+        return []
+    requested_missing = [name for name in requested if name in missing]
+    dep_map = {name: set(dependencies(name)) for name in requested_missing}
+    roots = [
+        name for name in requested_missing
+        if not any(name in deps for parent, deps in dep_map.items() if parent != name)
+    ]
+    covered = set()
+    for root in roots:
+        covered.update(dep_map[root])
+    # A missing root also bundles its dependencies. If the root already has
+    # a bottle but a dependency does not, schedule the dependency separately.
+    return [item for item in plan if item.name in missing
+            and (item.name in roots or item.name not in covered)]
+
+
+def show_cloud_jobs(
+    candidates: list[Planned], catalog: WorkflowCatalog,
+) -> tuple[list[Planned], bool]:
+    """Return uncovered jobs and whether anything is already underway."""
+    needed: list[Planned] = []
+    waiting = False
+    for item in candidates:
+        active, previous = catalog.match(item.name, item.version)
+        if active:
+            waiting = True
+            label = "exact version" if active.version == item.version else "version NOT VERIFIED"
+            print(
+                f"  {item.name} {item.version}: cloud {active.status} ({label})"
+                f"\n    {active.url}"
+            )
+            continue
+        if previous:
+            message(
+                f"previous build {previous.conclusion}: {item.name} {item.version}"
+                f"\n    {previous.url}"
+            )
+        needed.append(item)
+    return needed, waiting
 
 
 def download_verified(bottle: Bottle, folder: Path) -> Path:
@@ -268,23 +439,39 @@ def download_verified(bottle: Bottle, folder: Path) -> Path:
     return result
 
 
-def trigger_build(names: list[str]) -> int:
-    if not names:
-        raise BottleError("specify at least one formula")
-    for name in names:
-        validate_formula(name)
+def dispatch_build(items: list[Planned]) -> int:
+    if not items:
+        return 0
     if not shutil.which("gh"):
         raise BottleError("GitHub CLI 'gh' is required to trigger cloud builds")
-    formulae = ",".join(dict.fromkeys(names))
+    versions = ",".join(item.name + "=" + item.version for item in items)
+    formulae = ",".join(item.name for item in items)
     cmd = [
         "gh", "workflow", "run", "build.yml", "--repo", REPO,
-        "-f", "formulae=" + formulae, "-f", "skip_if_bottled=false",
+        "-f", "formulae=" + formulae,
+        "-f", "versions=" + versions,
+        "-f", "skip_if_bottled=false",
     ]
     result = subprocess.run(cmd, check=False)
     if result.returncode == 0:
-        print("Cloud build requested: " + formulae)
+        print("Cloud build requested: " + versions)
         print("https://github.com/" + REPO + "/actions/workflows/build.yml")
     return result.returncode
+
+
+def trigger_build(names: list[str], *, force: bool = False) -> int:
+    if not names:
+        raise BottleError("specify at least one formula")
+    candidates: list[Planned] = []
+    for name in dict.fromkeys(names):
+        validate_formula(name)
+        candidates.append(Planned(name, stable_version(formula_info(name)), "missing"))
+    if not force:
+        candidates, _ = show_cloud_jobs(candidates, WorkflowCatalog())
+    if not candidates:
+        message("matching or unverified cloud builds already exist; no duplicate scheduled")
+        return 0
+    return dispatch_build(candidates)
 
 
 def install(names: list[str], *, dry_run: bool = False, yes: bool = False) -> int:
@@ -294,19 +481,33 @@ def install(names: list[str], *, dry_run: bool = False, yes: bool = False) -> in
     plan = installation_plan(names, tag, catalog)
     print_plan(plan)
     missing = [entry.name for entry in plan if entry.source == "missing"]
-    if dry_run:
-        if missing:
-            message("missing: " + ", ".join(missing))
-        return 0
     if missing:
-        message("no usable Bottle found for: " + ", ".join(missing))
-        if sys.stdin.isatty() and not yes:
-            answer = input("Trigger a GitHub Actions build for missing formulae? [y/N] ").strip().lower()
-            if answer in {"y", "yes"}:
-                trigger_build(missing)
+        candidates = build_candidates(plan, names)
+        bundled = set(missing) - {item.name for item in candidates}
+        message("missing bottles: " + ", ".join(missing))
+        if bundled:
+            message("dependency bottles to be built with their parent formula: "
+                    + ", ".join(sorted(bundled)))
+        new_jobs, existing = show_cloud_jobs(candidates, WorkflowCatalog())
+        if not new_jobs:
+            message("already queued/building on GitHub; no new job required"
+                    if existing else "no new build required")
         else:
-            message("to build remotely: brew intel-bottle build " + " ".join(missing))
+            message("new cloud jobs required: " + ", ".join(
+                item.name + "=" + item.version for item in new_jobs
+            ))
+        if dry_run:
+            return 0
+        if new_jobs and sys.stdin.isatty() and not yes:
+            answer = input("Schedule only the missing cloud jobs? [y/N] ").strip().lower()
+            if answer in {"y", "yes"}:
+                return 2 if dispatch_build(new_jobs) == 0 else 1
+        if new_jobs:
+            message("to build remotely: brew intel-bottle build "
+                    + " ".join(item.name for item in new_jobs))
         return 2
+    if dry_run:
+        return 0
 
     if not yes and any(entry.source == "release" for entry in plan) and sys.stdin.isatty():
         answer = input("Install the listed GitHub Release bottles? [y/N] ").strip().lower()
@@ -342,8 +543,9 @@ HELP = """Usage: brew intel-bottle <command> [options]
       Show official and self-hosted bottle availability.
   releases
       List recent published Intel Bottle releases.
-  build FORMULA [...]
-      Dispatch a GitHub Actions run for missing bottles.
+  build [--force] FORMULA [...]
+      Dispatch only formulas not already queued/building on GitHub.
+      --force bypasses duplicate protection (explicit override).
   help
       Show this help.
 
@@ -363,7 +565,8 @@ def main(args: list[str]) -> int:
         print(HELP)
         return 0
     if cmd == "build":
-        return trigger_build(rest)
+        force = "--force" in rest
+        return trigger_build([name for name in rest if name != "--force"], force=force)
     if cmd == "status":
         if len(rest) != 1:
             raise BottleError("usage: brew intel-bottle status FORMULA")
@@ -375,6 +578,14 @@ def main(args: list[str]) -> int:
         print("  Homebrew official bottle:", "available" if official_bottle(info, tag) else "not available")
         hosted = ReleaseCatalog(tag).find(rest[0], version, brew("--cellar"))
         print("  Intel release bottle:", hosted.release_url if hosted else "not published")
+        if not hosted and not official_bottle(info, tag):
+            active, prior = WorkflowCatalog().match(rest[0], version)
+            if active:
+                print(f"  Cloud build: {active.status} ({active.version or 'version unverified'})")
+                print("  " + active.url)
+            elif prior:
+                print(f"  Previous cloud build: {prior.conclusion}")
+                print("  " + prior.url)
         return 0
     if cmd == "releases":
         if rest:

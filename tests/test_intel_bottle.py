@@ -46,8 +46,8 @@ class BottleTests(unittest.TestCase):
         with (
             patch.object(module, "dependencies", return_value=["openssl@3"]),
             patch.object(module, "brew", return_value="/usr/local/Cellar"),
-            patch.object(module, "formula_info", side_effect=info),
-            patch.object(module, "installed_versions", side_effect=lambda name: ["3.6.5"] if name == "openssl@3" else ["1.37.0_2"]),
+            patch.object(module, "formula_infos", side_effect=lambda names: {n: info(n) for n in names}),
+            patch.object(module, "all_installed_versions", return_value={"openssl@3": ["3.6.5"], "aria2": ["1.37.0_2"]}),
         ):
             catalog = module.ReleaseCatalog("sequoia")
             with patch.object(catalog, "find", return_value=None):
@@ -111,8 +111,8 @@ class BottleTests(unittest.TestCase):
         with (
             patch.object(module, "dependencies", return_value=["abseil"]),
             patch.object(module, "brew", return_value="/usr/local/Cellar"),
-            patch.object(module, "formula_info", side_effect=formula),
-            patch.object(module, "installed_versions", return_value=[]),
+            patch.object(module, "formula_infos", side_effect=lambda names: {n: formula(n) for n in names}),
+            patch.object(module, "all_installed_versions", return_value={}),
         ):
             catalog = module.ReleaseCatalog("sequoia")
             with patch.object(catalog, "find", return_value=None):
@@ -126,6 +126,8 @@ class BottleTests(unittest.TestCase):
             patch.object(module, "check_platform", return_value="sequoia"),
             patch.object(module, "installation_plan", return_value=plan),
             patch.object(module.subprocess, "call") as native,
+            patch.object(module, "show_cloud_jobs", return_value=(plan, False)),
+            patch.object(module, "dependencies", return_value=[]),
             patch.object(module.sys.stdin, "isatty", return_value=False),
         ):
             self.assertEqual(module.install(["llvm"]), 2)
@@ -140,6 +142,100 @@ class BottleTests(unittest.TestCase):
         ):
             self.assertEqual(module.install(["protobuf"], dry_run=True), 0)
             native.assert_not_called()
+
+
+    def test_bulk_formula_metadata(self):
+        with patch.object(module, "brew", return_value=json.dumps({
+            "formulae": [{"name": "aria2", "versions": {"stable": "1.37.0"}},
+                         {"name": "openssl@3", "versions": {"stable": "3.5.9"}}]
+        })) as native:
+            info = module.formula_infos(["aria2", "openssl@3"])
+            self.assertEqual(sorted(info), ["aria2", "openssl@3"])
+            native.assert_called_once_with("info", "--json=v2", "--formula",
+                                           "aria2", "openssl@3")
+
+    def test_cloud_job_exact_version_matching(self):
+        current = module.CloudJob("aria2", "1.37.0_3", "in_progress", None,
+                                  "https://example.test/job", 123, "in_progress")
+        other = module.CloudJob("aria2", "1.37.0_2", "in_progress", None,
+                                "https://example.test/old", 122, "in_progress")
+        catalog = module.WorkflowCatalog()
+        catalog._jobs = [other, current]
+        self.assertIs(catalog.match("aria2", "1.37.0_3")[0], current)
+        self.assertIs(catalog.match("aria2", "1.37.0_4")[0], None)
+
+    def test_legacy_cloud_job_never_claims_exact_match(self):
+        old = module.CloudJob("aria2", None, "in_progress", None,
+                              "https://example.test/old", 122, "in_progress")
+        catalog = module.WorkflowCatalog()
+        catalog._jobs = [old]
+        active, _ = catalog.match("aria2", "1.37.0_3")
+        self.assertIs(active, old)
+        self.assertIsNone(active.version)
+
+    def test_completed_cloud_failure_can_be_retried(self):
+        old = module.CloudJob("aria2", "1.37.0_3", "completed", "failure",
+                              "https://example.test/old", 122, "completed")
+        catalog = module.WorkflowCatalog()
+        catalog._jobs = [old]
+        self.assertEqual(catalog.match("aria2", "1.37.0_3"), (None, old))
+
+    def test_workflow_run_carries_versions_in_names(self):
+        runs = {"workflow_runs": [{
+            "id": 123, "status": "queued",
+            "display_title": "Intel Bottles [aria2,llvm] versions=[aria2=1.37.0_3,llvm=23.1.3_1]",
+            "html_url": "https://example.test/run",
+        }]}
+        def respond(path):
+            if path.endswith("runs?per_page=100"):
+                return runs
+            return {"jobs": [{"name": "prepare", "status": "in_progress"}]}
+        with patch.object(module, "github_api", side_effect=respond):
+            catalog = module.WorkflowCatalog()
+            active, _ = catalog.match("aria2", "1.37.0_3")
+            self.assertEqual((active.name, active.version, active.status),
+                             ("aria2", "1.37.0_3", "queued"))
+
+    def test_cloud_dependency_build_coalescing(self):
+        plan = [module.Planned("cares", "1", "missing"),
+                module.Planned("openssl@3", "3.5.9", "missing"),
+                module.Planned("aria2", "1.37.0_3", "missing")]
+        with patch.object(module, "dependencies", return_value=["cares", "openssl@3"]):
+            jobs = module.build_candidates(plan, ["aria2"])
+        self.assertEqual([job.name for job in jobs], ["aria2"])
+
+    def test_cloud_dependency_only_build(self):
+        plan = [module.Planned("cares", "1", "missing"),
+                module.Planned("aria2", "1.37.0_3", "release")]
+        jobs = module.build_candidates(plan, ["aria2"])
+        self.assertEqual([job.name for job in jobs], ["cares"])
+
+    def test_cloud_multiple_roots_deduplicate_shared_dependency(self):
+        plan = [module.Planned("common", "1", "missing"),
+                module.Planned("root-a", "2", "missing"),
+                module.Planned("root-b", "3", "missing")]
+        with patch.object(module, "dependencies", return_value=["common"]):
+            jobs = module.build_candidates(plan, ["root-a", "root-b"])
+        self.assertEqual([job.name for job in jobs], ["root-a", "root-b"])
+
+    def test_cloud_dispatch_always_pins_versions(self):
+        items = [module.Planned("aria2", "1.37.0_3", "missing"),
+                 module.Planned("openssl@3", "3.5.9", "missing")]
+        with patch.object(module.shutil, "which", return_value="/usr/local/bin/gh"), \
+             patch.object(module.subprocess, "run") as call:
+            call.return_value.returncode = 0
+            self.assertEqual(module.dispatch_build(items), 0)
+            cmd = call.call_args.args[0]
+            self.assertIn("versions=aria2=1.37.0_3,openssl@3=3.5.9", cmd)
+            self.assertIn("formulae=aria2,openssl@3", cmd)
+
+    def test_build_avoids_repeated_active_job(self):
+        with patch.object(module, "formula_info",
+                          return_value={"name": "aria2", "versions": {"stable": "1.37.0"}, "revision": 3}), \
+             patch.object(module, "show_cloud_jobs", return_value=([], True)), \
+             patch.object(module, "dispatch_build") as dispatch:
+            self.assertEqual(module.trigger_build(["aria2"]), 0)
+            dispatch.assert_not_called()
 
 
 if __name__ == "__main__":

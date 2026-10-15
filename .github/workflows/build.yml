@@ -1,4 +1,5 @@
 name: Build Intel Bottles
+run-name: Intel Bottles [${{ inputs.formulae }}] versions=[${{ inputs.versions }}]
 on:
   workflow_dispatch:
     inputs:
@@ -7,6 +8,11 @@ on:
         required: false
         default: 'llvm,rust,openvino,boost,protobuf'
         type: string
+      versions:
+        description: 'Optional pinned versions, e.g. aria2=1.37.0_3,openssl@3=3.5.9'
+        type: string
+        required: false
+        default: ''
       skip_if_bottled:
         description: 'Skip formulae already bottled for Intel Sequoia'
         type: boolean
@@ -24,6 +30,7 @@ jobs:
       - id: matrix
         env:
           FORMULAE: ${{ inputs.formulae }}
+          VERSIONS: ${{ inputs.versions }}
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os, re
@@ -31,12 +38,24 @@ jobs:
           names = list(dict.fromkeys(x.strip() for x in raw.split(",") if x.strip()))
           if not names or len(names) > 20 or any(not re.fullmatch(r"[a-zA-Z0-9@+_.-]+", n) for n in names):
               raise SystemExit("Expected 1–20 comma-separated Homebrew formula names")
-          print("matrix=" + json.dumps({"formula": names}))
+          requested = {}
+          for pair in filter(None, (x.strip() for x in os.environ.get("VERSIONS", "").split(","))):
+              if "=" not in pair:
+                  raise SystemExit("Pinned versions must be formula=version pairs")
+              name, version = pair.split("=", 1)
+              if name not in names or not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+_~-]*", version):
+                  raise SystemExit("Invalid or extraneous pinned version: " + pair)
+              if name in requested:
+                  raise SystemExit("Duplicate pinned version: " + name)
+              requested[name] = version
+          print("matrix=" + json.dumps({"include": [
+              {"formula": name, "version": requested.get(name, "")} for name in names
+          ]}))
           PY
 
   bottle:
     needs: prepare
-    name: ${{ matrix.formula }}
+    name: ${{ matrix.formula }} [${{ matrix.version }}]
     runs-on: macos-15-intel
     timeout-minutes: 360
     strategy:
@@ -48,6 +67,9 @@ jobs:
         run: |
           uname -m
           sw_vers
+          [[ "$(uname -m)" == "x86_64" ]]
+          [[ "$(sw_vers -productVersion)" == 15.* ]]
+          [[ "$(brew --prefix)" == "/usr/local" ]]
           brew config
           df -h .
       - name: Check bottle availability
@@ -55,6 +77,7 @@ jobs:
         env:
           HOMEBREW_NO_AUTO_UPDATE: '1'
           FORMULA: ${{ matrix.formula }}
+          EXPECTED_VERSION: ${{ matrix.version }}
           SKIP_IF_BOTTLED: ${{ inputs.skip_if_bottled }}
         run: |
           set -euo pipefail
@@ -64,9 +87,17 @@ jobs:
           import json, os
           data = json.load(open(os.environ["RUNNER_TEMP"] + "/formula-info.json"))
           formula = data["formulae"][0]
+          actual = str(formula["versions"]["stable"])
+          revision = int(formula.get("revision") or 0)
+          if revision:
+              actual += "_" + str(revision)
+          expected = os.environ.get("EXPECTED_VERSION")
+          if expected and actual != expected:
+              raise SystemExit(f"Requested {formula['name']} {expected}, but runner resolves {actual}; refusing mismatched build")
+          print("resolved_version=" + actual)
           files = (formula.get("bottle") or {}).get("stable", {}).get("files") or {}
-          tag = "sequoia" if os.uname().machine == "arm64" else "sequoia"
-          # Homebrew may use the generic Intel tag or a compatible older macOS bottle.
+          tag = "sequoia"
+          # This runner is Intel macOS 15; never confuse arm64 bottles with x86_64.
           available = any(k == tag or k.startswith(tag + "_") for k in files)
           print("available=" + str(available).lower())
           print("skip=" + str(available and os.getenv("SKIP_IF_BOTTLED", "true").lower() == "true").lower())
@@ -86,8 +117,8 @@ jobs:
           brew deps --include-build --include-test --tree "$FORMULA" > dependency-tree.log
           brew deps --include-build --include-test "$FORMULA" | sort -u > dependency-list.txt
           brew install --only-dependencies --build-from-source --verbose "$FORMULA" 2>&1 | tee dependencies.log
-          brew install --build-bottle --verbose "$FORMULA" 2>&1 | tee build.log
-          brew bottle --json "$FORMULA" 2>&1 | tee bottle.log
+          # Bottle dependencies before building the root, so they survive
+          # even if the root Formula fails.
           # Preserve locally built dependencies as installable bottles where supported.
           while IFS= read -r dep; do
             [[ -n "$dep" ]] || continue
@@ -96,6 +127,8 @@ jobs:
               brew bottle --json "$dep" >> dependency-bottles.log 2>&1 || echo "Unable to bottle $dep" >> dependency-bottles.log
             fi
           done < dependency-list.txt
+          brew install --build-bottle --verbose "$FORMULA" 2>&1 | tee build.log
+          brew bottle --json "$FORMULA" 2>&1 | tee bottle.log
           shasum -a 256 ./*.tar.gz > SHA256SUMS
       - name: Upload build logs and bottles
         if: always()
@@ -111,7 +144,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
       - name: Publish successful formula independently
-        if: success() && steps.preflight.outputs.skip != 'true'
+        if: always() && steps.preflight.outcome == 'success' && steps.preflight.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -119,12 +152,34 @@ jobs:
           FORMULA: ${{ matrix.formula }}
         run: |
           set -euo pipefail
+          if [[ ! -d "$RUNNER_TEMP/bottles" ]]; then
+            echo "No dependency archives were produced"
+            exit 0
+          fi
           cd "$RUNNER_TEMP/bottles"
           shopt -s nullglob
-          bottles=(*.tar.gz)
-          [[ ${#bottles[@]} -gt 0 ]] || { echo "No bottles to publish" >&2; exit 1; }
-          assets=(*.tar.gz *.json SHA256SUMS)
+          assets=()
+          for metadata in *.bottle.json; do
+            archive=$(python3 - "$metadata" <<'PY'
+          import json,sys
+          obj = next(iter(json.load(open(sys.argv[1])).values()))
+          print(obj["bottle"]["tags"]["sequoia"]["local_filename"])
+          PY
+            )
+            if [[ -f "$archive" ]]; then
+              assets+=("$archive" "$metadata")
+            fi
+          done
+          [[ ${#assets[@]} -gt 0 ]] || { echo "No valid Bottle+JSON pairs to publish"; exit 0; }
+          bottles=()
+          for asset in "${assets[@]}"; do
+            if [[ "$asset" == *.tar.gz ]]; then
+              bottles+=("$asset")
+            fi
+          done
+          shasum -a 256 "${bottles[@]}" > SHA256SUMS
+          assets+=(SHA256SUMS)
           gh release create "$TAG" "${assets[@]}" \
             --title "Intel Sequoia Bottles: $FORMULA" \
-            --notes "Built by GitHub Actions run $GITHUB_RUN_ID on macos-15-intel. Includes dependency bottles if supported. Metadata records source revisions and checksums." \
+            --notes "Built by GitHub Actions run $GITHUB_RUN_ID on macos-15-intel. May include partial dependency bottles when the root job fails. Consult workflow logs for root status." \
             --latest=false

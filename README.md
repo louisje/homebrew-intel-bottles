@@ -20,8 +20,11 @@ Homebrew commands not explicitly handled by the extension are forwarded to the r
     # Install from Homebrew or a verified GitHub Release:
     brew intel-bottle install protobuf
 
-    # Request a remote build:
+    # Request a remote build, unless the same Formula version is already active:
     brew intel-bottle build llvm
+
+    # Explicitly override duplicate protection if required:
+    brew intel-bottle build --force llvm
 
 ### Optional transparent Bash alias
 
@@ -40,11 +43,13 @@ The alias only affects interactive Bash by default. Scripts, direct /usr/local/b
 
 For plain formula names passed to install:
 
-1. Resolve the current formula version and transitive required/recommended dependencies through Homebrew, in topological order.
-2. Keep dependencies already installed at the same version; refuse to silently replace dependencies installed at another version.
-3. Prefer an official Bottle with the exact OS tag. Otherwise look for a matching version, Sequoia tag, and compatible Cellar in our GitHub Release assets.
-4. Show the installation plan. Verify each downloaded tar.gz against its corresponding Bottle JSON SHA256 before passing the local archive path to /usr/local/bin/brew install.
-5. If any required Bottle is missing, stop before installing anything and offer to dispatch a GitHub Actions build. **Never automatically compile a missing source package locally.**
+1. Resolve current Formula versions **including revisions** and recursive required/recommended dependencies through Homebrew. A bulk JSON query reduces repeated Homebrew startup overhead.
+2. Keep installed dependencies instead of silently upgrading/downgrading them, even if the current Formula version differs. Homebrew still performs its own installation/linkage checks.
+3. Prefer an official Bottle for the exact OS tag. Otherwise look for a matching version/revision, Sequoia tag, compatible Cellar, and SHA256 in GitHub Releases.
+4. When Bottle files are missing, query active GitHub Actions **by Formula and pinned version**. Display the existing job and do not dispatch a duplicate. Older jobs without a version are shown as **unverified**, never claimed to match exactly; they also block implicit duplicate dispatch. Use --force only after reviewing them.
+5. Group absent dependencies under an absent root Formula: that cloud root job already builds and bottles its dependencies. If the root Bottle is available but a dependency is not, schedule the missing dependency separately. Avoid separate dependency jobs when a missing root already covers them; two different roots may still rebuild the same dependency on separate runners.
+6. If a new cloud build is needed, request confirmation and dispatch only uncovered roots/dependencies with explicit version pins. On a previous failure, display the failure link and offer a retry. Cloud builds are asynchronous.
+7. When all necessary Bottles exist, show the install plan, download the archives, validate SHA256, and pass them to the original Homebrew. **Never automatically compile a missing source package locally.**
 
 --dry-run is read-only, --yes skips interactive confirmation of self-hosted bottles, and build explicitly requests a GitHub Actions job. Remote builds are asynchronous: output is available for installation only after the GitHub Release is published.
 
@@ -56,7 +61,9 @@ Run the Build Intel Bottles GitHub Actions workflow manually, or invoke:
 
     gh workflow run build.yml -R louisje/homebrew-intel-bottles -f formulae=llvm,rust,openvino,boost,protobuf -f skip_if_bottled=true
 
-The workflow runs up to five matrix jobs on macos-15-intel, building dependencies from source before the target, and attempting to bottle installed dependencies too. Each **successful formula independently** publishes a GitHub Release with the Bottle tarballs, JSON metadata, and SHA256SUMS. A failed or timed-out formula does not prevent other successful formulae from publishing.
+The workflow runs up to five matrix jobs on macos-15-intel. The command adds the versions input (formula=version including the Homebrew revision). The runner validates each pinned version against its own brew info metadata before beginning an expensive build. Job names expose Formula and version for robust status queries. Manual builds without version pins are allowed, but clients consider their versions unverified.
+
+The workflow builds dependencies from source, **bottles those dependencies first**, and then builds the root Formula. Independent per-Formula GitHub Releases contain valid Bottle+JSON pairs and SHA256SUMS. If a root build fails after dependencies were bottled, their valid archives can still be published as a partial Release, while the job correctly reports failure.
 
 Each tag is bottles-RUN_ID-ATTEMPT-FORMULA. Original Bottle archive filenames are kept intact. Logs and metadata are separately retained as GitHub Actions artifacts for 30 days.
 
