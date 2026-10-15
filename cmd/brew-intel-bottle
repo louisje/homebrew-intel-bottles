@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""Homebrew Intel bottle helper; all non-install commands pass through unchanged."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from typing import Any
+
+REPO = os.environ.get("INTEL_BOTTLE_REPO", "louisje/homebrew-intel-bottles")
+REAL_BREW = os.environ.get("INTEL_BOTTLE_BREW", "/usr/local/bin/brew")
+FORMULA_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9@+_.-]*$")
+MACOS_TAGS = {13: "ventura", 14: "sonoma", 15: "sequoia", 16: "tahoe"}
+
+
+class BottleError(RuntimeError):
+    pass
+
+
+def message(value: str) -> None:
+    print("intel-bottle: " + value, file=sys.stderr)
+
+
+def brew(*args: str, capture: bool = True) -> str:
+    result = subprocess.run(
+        [REAL_BREW, *args], text=True,
+        capture_output=capture, check=False,
+    )
+    if result.returncode:
+        raise BottleError(
+            "brew " + " ".join(args) + " failed: "
+            + (result.stderr.strip() or result.stdout.strip())
+        )
+    return result.stdout.strip() if capture else ""
+
+
+def passthrough(args: list[str]) -> int:
+    return subprocess.call([REAL_BREW, *args])
+
+
+def check_platform() -> str:
+    if platform.system() != "Darwin" or platform.machine() != "x86_64":
+        raise BottleError("custom bottles currently support Intel macOS only")
+    version = platform.mac_ver()[0]
+    major = int(version.split(".")[0]) if version else 0
+    if major not in MACOS_TAGS:
+        raise BottleError("unsupported macOS version: " + version)
+    prefix = brew("--prefix")
+    if prefix != "/usr/local":
+        raise BottleError("custom bottles require /usr/local (found " + prefix + ")")
+    return MACOS_TAGS[major]
+
+
+def formula_info(name: str) -> dict[str, Any]:
+    obj = json.loads(brew("info", "--json=v2", "--formula", name))
+    formulae = obj.get("formulae", [])
+    if len(formulae) != 1:
+        raise BottleError("could not resolve formula " + name)
+    return formulae[0]
+
+
+def stable_version(info: dict[str, Any]) -> str:
+    value = (info.get("versions") or {}).get("stable")
+    if not value:
+        raise BottleError("no stable version for " + info["name"])
+    return str(value)
+
+
+def official_bottle(info: dict[str, Any], tag: str) -> bool:
+    files = ((info.get("bottle") or {}).get("stable") or {}).get("files") or {}
+    return tag in files
+
+
+def installed_versions(name: str) -> list[str]:
+    raw = brew("list", "--versions", "--formula", name)
+    chunks = raw.split()
+    return chunks[1:] if chunks and chunks[0] == name else []
+
+
+def github_api(path: str) -> Any:
+    gh = shutil.which("gh")
+    if gh:
+        result = subprocess.run(
+            [gh, "api", "-H", "Accept: application/vnd.github+json", path],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+    url = "https://api.github.com/" + path.lstrip("/")
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "brew-intel-bottle"}
+    token = os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=25) as response:
+            return json.load(response)
+    except (OSError, ValueError) as exc:
+        raise BottleError("GitHub API request failed: " + str(exc)) from exc
+
+
+def read_url(url: str) -> bytes:
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(url, headers={"User-Agent": "brew-intel-bottle"}), timeout=60
+        ) as response:
+            return response.read()
+    except OSError as exc:
+        raise BottleError("download failed (" + url + "): " + str(exc)) from exc
+
+
+@dataclass(frozen=True)
+class Bottle:
+    name: str
+    version: str
+    filename: str
+    sha256: str
+    download_url: str
+    release_url: str
+    cellar: str
+
+
+class ReleaseCatalog:
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+        self.releases: list[dict[str, Any]] | None = None
+        self.cache: dict[tuple[str, str], Bottle | None] = {}
+
+    def all(self) -> list[dict[str, Any]]:
+        if self.releases is None:
+            data = github_api("repos/" + REPO + "/releases?per_page=100")
+            if not isinstance(data, list):
+                raise BottleError("unexpected GitHub releases response")
+            self.releases = [r for r in data if not r.get("draft") and not r.get("prerelease")]
+        return self.releases
+
+    def find(self, name: str, version: str, cellar: str) -> Bottle | None:
+        key = (name, version)
+        if key in self.cache:
+            return self.cache[key]
+        prefix = name + "--" + version + "." + self.tag + ".bottle"
+        for release in self.all():
+            assets = {a["name"]: a for a in release.get("assets", [])}
+            for asset_name, asset in assets.items():
+                if not asset_name.startswith(prefix) or not asset_name.endswith(".json"):
+                    continue
+                meta = json.loads(read_url(asset["browser_download_url"]))
+                entry = meta.get(name, {})
+                if str((entry.get("formula") or {}).get("pkg_version")) != version:
+                    continue
+                bottle = entry.get("bottle") or {}
+                target = (bottle.get("tags") or {}).get(self.tag)
+                if not target:
+                    continue
+                # Metadata is a description, not an installation instruction.
+                compatible_cellars = {"any", "any_skip_relocation", ":any", ":any_skip_relocation", cellar}
+                if str(bottle.get("cellar")) not in compatible_cellars:
+                    continue
+                archive = assets.get(target["local_filename"])
+                if not archive:
+                    continue
+                result = Bottle(
+                    name=name, version=version, filename=archive["name"],
+                    sha256=target["sha256"],
+                    download_url=archive["browser_download_url"],
+                    release_url=release["html_url"],
+                    cellar=str(bottle["cellar"]),
+                )
+                self.cache[key] = result
+                return result
+        self.cache[key] = None
+        return None
+
+
+def validate_formula(name: str) -> None:
+    if not FORMULA_PATTERN.fullmatch(name):
+        raise BottleError("expected an unqualified Homebrew formula name, got: " + name)
+
+
+def dependencies(name: str) -> list[str]:
+    # brew deps --topological includes transitive required and recommended deps.
+    values = brew("deps", "--topological", "--formula", name).splitlines()
+    return [x.split("/")[-1] for x in values if x.strip()]
+
+
+@dataclass
+class Planned:
+    name: str
+    version: str
+    source: str
+    bottle: Bottle | None = None
+
+
+def installation_plan(names: list[str], tag: str, catalog: ReleaseCatalog) -> list[Planned]:
+    queue: list[str] = []
+    for name in names:
+        validate_formula(name)
+        queue.extend(dependencies(name))
+        queue.append(name)
+    # Each dependency appears before its dependents; preserve order without duplicates.
+    queue = list(dict.fromkeys(queue))
+    cellar = brew("--cellar")
+    actions: list[Planned] = []
+    for name in queue:
+        info = formula_info(name)
+        version = stable_version(info)
+        installed = installed_versions(name)
+        if version in installed:
+            actions.append(Planned(name, version, "installed"))
+            continue
+        if installed and name not in names:
+            raise BottleError(
+                name + " has another installed version (" + ", ".join(installed)
+                + "); refusing to upgrade dependency silently"
+            )
+        if official_bottle(info, tag):
+            actions.append(Planned(name, version, "official"))
+            continue
+        candidate = catalog.find(name, version, cellar)
+        actions.append(Planned(name, version, "release" if candidate else "missing", candidate))
+    return actions
+
+
+def print_plan(plan: list[Planned]) -> None:
+    for action in plan:
+        label = {"installed": "installed", "official": "Homebrew bottle",
+                 "release": "GitHub Release", "missing": "MISSING"}[action.source]
+        print("  {name} {version}: {label}".format(name=action.name, version=action.version, label=label))
+        if action.bottle:
+            print("    " + action.bottle.release_url)
+
+
+def download_verified(bottle: Bottle, folder: Path) -> Path:
+    result = folder / bottle.filename
+    # Only use a filename selected from bottle metadata, never a supplied URL path.
+    if result.name != bottle.filename or "/" in bottle.filename or ".." in bottle.filename:
+        raise BottleError("unsafe bottle filename")
+    headers = {"User-Agent": "brew-intel-bottle"}
+    digest = hashlib.sha256()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(bottle.download_url, headers=headers), timeout=180) as stream:
+            with result.open("wb") as output:
+                while True:
+                    block = stream.read(1024 * 1024)
+                    if not block:
+                        break
+                    digest.update(block)
+                    output.write(block)
+    except OSError as exc:
+        result.unlink(missing_ok=True)
+        raise BottleError("failed to download " + bottle.name + ": " + str(exc)) from exc
+    if digest.hexdigest().lower() != bottle.sha256.lower():
+        result.unlink(missing_ok=True)
+        raise BottleError("SHA256 mismatch for " + bottle.filename)
+    return result
+
+
+def trigger_build(names: list[str]) -> int:
+    if not names:
+        raise BottleError("specify at least one formula")
+    for name in names:
+        validate_formula(name)
+    if not shutil.which("gh"):
+        raise BottleError("GitHub CLI 'gh' is required to trigger cloud builds")
+    formulae = ",".join(dict.fromkeys(names))
+    cmd = [
+        "gh", "workflow", "run", "build.yml", "--repo", REPO,
+        "-f", "formulae=" + formulae, "-f", "skip_if_bottled=false",
+    ]
+    result = subprocess.run(cmd, check=False)
+    if result.returncode == 0:
+        print("Cloud build requested: " + formulae)
+        print("https://github.com/" + REPO + "/actions/workflows/build.yml")
+    return result.returncode
+
+
+def install(names: list[str], *, dry_run: bool = False, yes: bool = False) -> int:
+    tag = check_platform()
+    catalog = ReleaseCatalog(tag)
+    print("Checking Intel " + tag + " bottles...")
+    plan = installation_plan(names, tag, catalog)
+    print_plan(plan)
+    missing = [entry.name for entry in plan if entry.source == "missing"]
+    if dry_run:
+        if missing:
+            message("missing: " + ", ".join(missing))
+        return 0
+    if missing:
+        message("no usable Bottle found for: " + ", ".join(missing))
+        if sys.stdin.isatty() and not yes:
+            answer = input("Trigger a GitHub Actions build for missing formulae? [y/N] ").strip().lower()
+            if answer in {"y", "yes"}:
+                trigger_build(missing)
+        else:
+            message("to build remotely: brew intel-bottle build " + " ".join(missing))
+        return 2
+
+    if not yes and any(entry.source == "release" for entry in plan) and sys.stdin.isatty():
+        answer = input("Install the listed GitHub Release bottles? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            message("cancelled; nothing installed")
+            return 1
+
+    with tempfile.TemporaryDirectory(prefix="intel-bottles-") as work:
+        root = Path(work)
+        for item in plan:
+            if item.source == "installed":
+                continue
+            if item.source == "official":
+                message("installing official bottle: " + item.name)
+                rc = subprocess.call([REAL_BREW, "install", "--force-bottle", item.name])
+            else:
+                assert item.bottle is not None
+                message("verifying GitHub bottle: " + item.bottle.filename)
+                archive = download_verified(item.bottle, root)
+                message("installing " + item.name + " using Homebrew")
+                rc = subprocess.call([REAL_BREW, "install", str(archive)])
+            if rc != 0:
+                return rc
+    return 0
+
+
+HELP = """Usage: brew intel-bottle <command> [options]
+
+  install [--dry-run] [--yes] FORMULA [...]
+      Prefer official bottles; fall back to verified Intel bottles from
+      louisje/homebrew-intel-bottles. Never silently compile from source.
+  status FORMULA
+      Show official and self-hosted bottle availability.
+  releases
+      List recent published Intel Bottle releases.
+  build FORMULA [...]
+      Dispatch a GitHub Actions run for missing bottles.
+  help
+      Show this help.
+
+Other Homebrew commands are passed to the original Homebrew unchanged.
+To use this transparently after testing:
+  alias brew='brew intel-bottle'
+"""
+
+
+def main(args: list[str]) -> int:
+    if args and args[0] == "intel-bottle":  # alias + explicit subcommand
+        args = args[1:]
+    if not args:
+        return passthrough(args)
+    cmd, *rest = args
+    if cmd == "help":
+        print(HELP)
+        return 0
+    if cmd == "build":
+        return trigger_build(rest)
+    if cmd == "status":
+        if len(rest) != 1:
+            raise BottleError("usage: brew intel-bottle status FORMULA")
+        validate_formula(rest[0])
+        tag = check_platform()
+        info = formula_info(rest[0])
+        version = stable_version(info)
+        print(rest[0] + " " + version + " (" + tag + ")")
+        print("  Homebrew official bottle:", "available" if official_bottle(info, tag) else "not available")
+        hosted = ReleaseCatalog(tag).find(rest[0], version, brew("--cellar"))
+        print("  Intel release bottle:", hosted.release_url if hosted else "not published")
+        return 0
+    if cmd == "releases":
+        if rest:
+            raise BottleError("usage: brew intel-bottle releases")
+        catalog = ReleaseCatalog(check_platform())
+        for release in catalog.all():
+            print(release["tag_name"] + "  " + release["html_url"])
+        return 0
+    if cmd == "install":
+        dry_run, yes = "--dry-run" in rest, "--yes" in rest
+        names = [x for x in rest if x not in {"--dry-run", "--yes"}]
+        if not names or any(not FORMULA_PATTERN.fullmatch(x) for x in names):
+            if dry_run or yes:
+                raise BottleError("--dry-run and --yes work only with plain formula names")
+            return passthrough(args)
+        return install(names, dry_run=dry_run, yes=yes)
+    return passthrough(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except (BottleError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        message("ERROR: " + str(exc))
+        sys.exit(1)

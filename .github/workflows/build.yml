@@ -110,33 +110,21 @@ jobs:
             ${{ runner.temp }}/bottles/SHA256SUMS
           if-no-files-found: warn
           retention-days: 30
-
-  publish:
-    needs: [prepare, bottle]
-    if: always() && needs.bottle.result == 'success'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: '*-intel'
-          path: release
-          merge-multiple: false
-      - name: Publish bottles to GitHub Release
+      - name: Publish successful formula independently
+        if: success() && steps.preflight.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: bottles-${{ github.run_id }}-${{ github.run_attempt }}
+          TAG: bottles-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.formula }}
+          FORMULA: ${{ matrix.formula }}
         run: |
           set -euo pipefail
-          mapfile -d '' files < <(find release -type f \( -name '*.tar.gz' -o -name '*.json' -o -name 'SHA256SUMS' \) -print0)
-          if (( ${#files[@]} == 0 )); then
-            echo "No bottles were produced; skipping release"
-            exit 0
-          fi
-          # Prefix names with the formula to avoid collisions among dependency bottles.
-          mkdir -p upload
-          for file in "${files[@]}"; do
-            folder=$(basename "$(dirname "$file")")
-            cp "$file" "upload/${folder}--$(basename "$file")"
-          done
-          gh release create "$TAG" upload/* --title "Intel macOS 15 Bottles ($TAG)" --notes "Built on macos-15-intel. Includes dependency bottles where Homebrew supports bottling. Check logs and SHA256SUMS before installation." --latest=false
+          cd "$RUNNER_TEMP/bottles"
+          shopt -s nullglob
+          bottles=(*.tar.gz)
+          [[ ${#bottles[@]} -gt 0 ]] || { echo "No bottles to publish" >&2; exit 1; }
+          assets=(*.tar.gz *.json SHA256SUMS)
+          gh release create "$TAG" "${assets[@]}" \
+            --title "Intel Sequoia Bottles: $FORMULA" \
+            --notes "Built by GitHub Actions run $GITHUB_RUN_ID on macos-15-intel. Includes dependency bottles if supported. Metadata records source revisions and checksums." \
+            --latest=false
