@@ -238,37 +238,42 @@ class BottleTests(unittest.TestCase):
             dispatch.assert_not_called()
 
 
-    def test_explicit_help_and_proxy_brew_help_are_distinct(self):
+    def test_alias_and_explicit_help_are_combined(self):
         from contextlib import redirect_stdout
         from io import StringIO
 
-        # Direct extension: brew intel-bottle --help / -h / help
-        for args in (["--help"], ["-h"], ["help"],
-                     ["--proxy", "intel-bottle", "--help"],
-                     ["--proxy", "intel-bottle", "-h"]):
+        # Direct extension, aliased brew, and legacy proxy should all
+        # reveal the extensions AND forwarded native Homebrew commands.
+        for args in ([], ["--help"], ["-h"], ["help"],
+                     ["intel-bottle", "--help"], ["intel-bottle", "-h"],
+                     ["--proxy", "--help"], ["--proxy", "help"],
+                     ["--proxy", "intel-bottle", "--help"]):
             with self.subTest(args=args), patch.object(module, "passthrough") as native:
                 out = StringIO()
                 with redirect_stdout(out):
                     self.assertEqual(module.main(args), 0)
-                self.assertIn("Usage: brew intel-bottle", out.getvalue())
-                self.assertIn("jobs [--all]", out.getvalue())
+                help_text = out.getvalue()
+                for expected in ("brew intel-bottle", "jobs [--all]",
+                                 "status FORMULA", "build [--force]",
+                                 "Original Homebrew commands", "info [FORMULA|CASK...]",
+                                 "upgrade [FORMULA|CASK...]", "command brew --help"):
+                    self.assertIn(expected, help_text)
                 native.assert_not_called()
 
-        # Aliased brew --help and brew help retain the native Homebrew help.
-        for args in (["--proxy", "--help"], ["--proxy", "-h"],
-                     ["--proxy", "help"], ["--proxy"]):
-            with self.subTest(args=args), patch.object(module, "passthrough", return_value=19) as native:
-                self.assertEqual(module.main(args), 19)
-                native.assert_called_once_with(args[1:])
-
-    def test_proxy_preserves_native_info_and_enables_jobs(self):
-        with patch.object(module, "passthrough", return_value=17) as native:
-            self.assertEqual(module.main(["--proxy", "info", "aria2"]), 17)
-            native.assert_called_once_with(["info", "aria2"])
+    def test_alias_forwards_native_commands_and_enables_jobs(self):
+        for args in (["info", "aria2"], ["--version"], ["outdated"],
+                     ["list"], ["upgrade"], ["doctor"]):
+            with self.subTest(args=args), patch.object(module, "passthrough", return_value=17) as native:
+                self.assertEqual(module.main(args), 17)
+                native.assert_called_once_with(args)
+        # Both current and old aliased shells accept the extension.
         with patch.object(module, "parse_jobs_options", return_value=0) as jobs:
-            self.assertEqual(module.main(["--proxy", "jobs", "aria2"]), 0)
-            self.assertEqual(module.main(["--proxy", "intel-bottle", "jobs", "--all"]), 0)
-            self.assertEqual(jobs.call_count, 2)
+            for args in (["jobs", "aria2"], ["intel-bottle", "jobs", "--all"],
+                         ["--proxy", "jobs", "aria2"],
+                         ["--proxy", "intel-bottle", "jobs", "--all"]):
+                with self.subTest(args=args):
+                    self.assertEqual(module.main(args), 0)
+            self.assertEqual(jobs.call_count, 4)
 
     def test_jobs_filtered_active_vs_all(self):
         from contextlib import redirect_stdout

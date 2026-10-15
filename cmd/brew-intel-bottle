@@ -577,46 +577,55 @@ def install(names: list[str], *, dry_run: bool = False, yes: bool = False) -> in
     return 0
 
 
-HELP = """Usage: brew intel-bottle <command> [options]
+HELP = """Usage: brew <command> [options]
+       brew intel-bottle <command> [options]
 
+Intel Bottle extensions (Intel macOS; Homebrew with Bottle fallback):
   install [--dry-run] [--yes] FORMULA [...]
-      Prefer official bottles; fall back to verified Intel bottles from
-      louisje/homebrew-intel-bottles. Never silently compile from source.
+      Prefer official bottles, then verified Intel GitHub Release bottles.
+      Missing bottles can be scheduled for cloud builds; never silently
+      compile missing source packages locally.
   status FORMULA
-      Show official and self-hosted bottle availability.
+      Show official/self-hosted Bottle availability and cloud build status.
   releases
-      List recent published Intel Bottle releases.
+      List recently published Intel Bottle releases.
   build [--force] FORMULA [...]
-      Dispatch only formulas not already queued/building on GitHub.
-      --force bypasses duplicate protection (explicit override).
+      Request missing cloud builds (avoid duplicate active jobs).
+      --force explicitly overrides duplicate protection.
   jobs [--all] [FORMULA]
-      List queued/running cloud jobs. With --all, include jobs from the
-      latest 20 completed workflow runs; optionally filter by Formula.
+      List active cloud jobs. --all includes recent completed jobs;
+      optionally filter by Formula.
   help, -h, --help
-      Show this extension help.
+      Show this combined Intel Bottle and Homebrew compatibility help.
 
-Other Homebrew commands are forwarded unchanged to the original Homebrew.
-For a transparent interactive Bash alias preserving native brew --help:
-  alias brew='brew intel-bottle --proxy'
+Original Homebrew commands (forwarded unchanged):
+  search TEXT|/REGEX/         Find Formulae and Casks.
+  info [FORMULA|CASK...]      Show package information.
+  list [FORMULA|CASK...]      List installed packages.
+  update                      Update Homebrew metadata.
+  upgrade [FORMULA|CASK...]   Upgrade installed packages (native Homebrew).
+  uninstall FORMULA|CASK...   Remove packages.
+  outdated                    List outdated packages.
+  doctor                      Diagnose Homebrew issues.
+  config                      Show Homebrew configuration.
+  --version                   Show Homebrew version.
+
+Other Homebrew commands and options are passed through unchanged.
+Note: install with Casks, --HEAD, or other unsupported options is also
+forwarded to Homebrew; it does NOT use Intel Bottle safety checks.
+For full native Homebrew help: command brew --help
+Transparent interactive Bash alias: alias brew='brew intel-bottle'
 """
 
 
 def main(args: list[str]) -> int:
-    # The --proxy marker distinguishes an aliased `brew --help` from an
-    # explicit `brew intel-bottle --help`. Without the marker their argv are
-    # identical; a conventional alias could not preserve both behaviours.
-    proxied = bool(args and args[0] == "--proxy")
-    if proxied:
+    # An interactive alias expands brew --help into
+    # brew intel-bottle --help; both show the combined help.
+    # Accept the retired --proxy marker for existing sessions until reloaded.
+    if args and args[0] == "--proxy":
         args = args[1:]
-        explicit = bool(args and args[0] == "intel-bottle")
-        if explicit:
-            args = args[1:]
-        elif not args or args[0] in {"help", "--help", "-h"}:
-            return passthrough(args)
-    elif args and args[0] == "intel-bottle":
-        # Accept old alias form until existing shells reload brew.alias.
+    if args and args[0] == "intel-bottle":
         args = args[1:]
-
     if not args:
         print(HELP)
         return 0

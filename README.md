@@ -37,11 +37,17 @@ Homebrew commands not explicitly handled by the extension are forwarded to the r
 
 After validating the extension on your machine, **opt in**:
 
-    alias brew='brew intel-bottle --proxy'
+    alias brew='brew intel-bottle'
 
-The internal --proxy marker resolves an argv ambiguity: brew --help must remain the native Homebrew help while brew intel-bottle --help must display the extension's help. The normal install command, brew install protobuf, uses the fallback handler; native commands such as brew list, brew info, brew upgrade, brew uninstall, brew --version, and brew --help continue unchanged. brew jobs (with the alias enabled) is equivalent to brew intel-bottle jobs. To bypass the alias or disable it:
+With this alias, **brew --help, brew -h, brew help**, and **brew intel-bottle --help** all display the combined Intel Bottle help, including extensions (jobs, status, build, releases) and common native Homebrew commands that pass through unchanged. Native brew list, brew info, brew upgrade, brew uninstall, and brew --version continue unchanged; brew jobs is equivalent to brew intel-bottle jobs.
 
+To see the full original Homebrew help or bypass the alias:
+
+    command brew --help
     command brew list
+
+To disable the alias in the current shell:
+
     unalias brew
 
 The alias only affects interactive Bash by default. Existing Bash sessions need to source ~/.bash_aliases.d/brew.alias or start a new shell after updating the alias. Scripts, direct /usr/local/bin/brew invocations, and other shells are not transparently intercepted.
