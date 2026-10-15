@@ -293,8 +293,9 @@ class CloudJob:
 class WorkflowCatalog:
     """Find cloud jobs by Formula + revision, without assuming old run versions."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, history_limit: int = 3) -> None:
         self._jobs: list[CloudJob] | None = None
+        self.history_limit = history_limit
 
     def all(self) -> list[CloudJob]:
         if self._jobs is not None:
@@ -311,7 +312,7 @@ class WorkflowCatalog:
             run_status = str(run.get("status") or "")
             is_active = run_status in ACTIVE_RUN_STATES
             if not is_active:
-                if completed_scanned >= 3:
+                if completed_scanned >= self.history_limit:
                     continue
                 completed_scanned += 1
             run_id = int(run["id"])
@@ -323,7 +324,8 @@ class WorkflowCatalog:
                 name = str(job.get("name", ""))
                 found = JOB_NAME_PATTERN.fullmatch(name)
                 formula, version = (found.group(1), found.group(2) or None) if found else (name, None)
-                if not FORMULA_PATTERN.fullmatch(formula):
+                # Coordinator jobs are not Formula builds.
+                if not FORMULA_PATTERN.fullmatch(formula) or formula in {"prepare", "publish"}:
                     continue
                 names_seen.add(formula)
                 all_jobs.append(CloudJob(
@@ -367,6 +369,47 @@ class WorkflowCatalog:
             if job.version == version and job.conclusion in {"failure", "cancelled", "timed_out"}:
                 return None, job
         return None, None
+
+
+def list_cloud_jobs(*, include_completed: bool = False, formula: str | None = None) -> int:
+    """Show active or recent cloud Formula jobs, not the prepare job."""
+    if formula is not None:
+        validate_formula(formula)
+    # Keep normal installs inexpensive; --all deliberately queries more
+    # historical runs. GitHub limits the initial list to 100 recent runs.
+    catalog = WorkflowCatalog(history_limit=20 if include_completed else 0)
+    jobs = [
+        job for job in catalog.all()
+        if (formula is None or job.name == formula)
+        and (include_completed or job.status in ACTIVE_RUN_STATES)
+    ]
+    title = "active and recent" if include_completed else "active"
+    if not jobs:
+        print(f"No {title} Intel Bottle jobs found"
+              + (f" for {formula}." if formula else "."))
+        return 0
+    print(f"Intel Bottle cloud jobs ({title}) — {REPO}")
+    for job in jobs:
+        state = job.conclusion if job.status == "completed" else job.status
+        version = job.version or "version unverified"
+        print(f"  {job.name} {version}: {state} (run #{job.run_id})")
+        print(f"    {job.url}")
+    return 0
+
+
+def parse_jobs_options(rest: list[str]) -> int:
+    if rest in (["--help"], ["-h"]):
+        print("Usage: brew intel-bottle jobs [--all] [FORMULA]\n"
+              "  Default: active queued/in-progress jobs only.\n"
+              "  --all: include jobs from the latest 20 completed workflow runs.\n"
+              "  FORMULA: filter by formula name, e.g. aria2.")
+        return 0
+    unknown = [x for x in rest if x.startswith("-") and x != "--all"]
+    names = [x for x in rest if x != "--all"]
+    if unknown or len(names) > 1:
+        raise BottleError("usage: brew intel-bottle jobs [--all] [FORMULA]")
+    return list_cloud_jobs(include_completed="--all" in rest,
+                           formula=names[0] if names else None)
 
 
 def build_candidates(plan: list[Planned], requested: list[str]) -> list[Planned]:
@@ -546,24 +589,43 @@ HELP = """Usage: brew intel-bottle <command> [options]
   build [--force] FORMULA [...]
       Dispatch only formulas not already queued/building on GitHub.
       --force bypasses duplicate protection (explicit override).
-  help
-      Show this help.
+  jobs [--all] [FORMULA]
+      List queued/running cloud jobs. With --all, include jobs from the
+      latest 20 completed workflow runs; optionally filter by Formula.
+  help, -h, --help
+      Show this extension help.
 
-Other Homebrew commands are passed to the original Homebrew unchanged.
-To use this transparently after testing:
-  alias brew='brew intel-bottle'
+Other Homebrew commands are forwarded unchanged to the original Homebrew.
+For a transparent interactive Bash alias preserving native brew --help:
+  alias brew='brew intel-bottle --proxy'
 """
 
 
 def main(args: list[str]) -> int:
-    if args and args[0] == "intel-bottle":  # alias + explicit subcommand
+    # The --proxy marker distinguishes an aliased `brew --help` from an
+    # explicit `brew intel-bottle --help`. Without the marker their argv are
+    # identical; a conventional alias could not preserve both behaviours.
+    proxied = bool(args and args[0] == "--proxy")
+    if proxied:
         args = args[1:]
+        explicit = bool(args and args[0] == "intel-bottle")
+        if explicit:
+            args = args[1:]
+        elif not args or args[0] in {"help", "--help", "-h"}:
+            return passthrough(args)
+    elif args and args[0] == "intel-bottle":
+        # Accept old alias form until existing shells reload brew.alias.
+        args = args[1:]
+
     if not args:
-        return passthrough(args)
-    cmd, *rest = args
-    if cmd == "help":
         print(HELP)
         return 0
+    cmd, *rest = args
+    if cmd in {"help", "-h", "--help"}:
+        print(HELP)
+        return 0
+    if cmd == "jobs":
+        return parse_jobs_options(rest)
     if cmd == "build":
         force = "--force" in rest
         return trigger_build([name for name in rest if name != "--force"], force=force)

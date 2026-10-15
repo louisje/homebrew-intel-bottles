@@ -16,6 +16,13 @@ Homebrew commands not explicitly handled by the extension are forwarded to the r
     brew intel-bottle status protobuf
     brew intel-bottle releases
     brew intel-bottle install --dry-run protobuf
+    brew intel-bottle --help
+
+    # Cloud jobs (pending/in-progress by default):
+    brew intel-bottle jobs
+    brew intel-bottle jobs aria2
+    brew intel-bottle jobs --all
+    brew intel-bottle jobs --all aria2
 
     # Install from Homebrew or a verified GitHub Release:
     brew intel-bottle install protobuf
@@ -30,14 +37,16 @@ Homebrew commands not explicitly handled by the extension are forwarded to the r
 
 After validating the extension on your machine, **opt in**:
 
-    alias brew='brew intel-bottle'
+    alias brew='brew intel-bottle --proxy'
 
-Now brew install protobuf uses the fallback handler, while native commands such as brew list, brew info, brew upgrade, brew uninstall, brew --version, and brew --help continue unchanged. To bypass the alias or disable it:
+The internal --proxy marker resolves an argv ambiguity: brew --help must remain the native Homebrew help while brew intel-bottle --help must display the extension's help. The normal install command, brew install protobuf, uses the fallback handler; native commands such as brew list, brew info, brew upgrade, brew uninstall, brew --version, and brew --help continue unchanged. brew jobs (with the alias enabled) is equivalent to brew intel-bottle jobs. To bypass the alias or disable it:
 
     command brew list
     unalias brew
 
-The alias only affects interactive Bash by default. Scripts, direct /usr/local/bin/brew invocations, and other shells are not transparently intercepted.
+The alias only affects interactive Bash by default. Existing Bash sessions need to source ~/.bash_aliases.d/brew.alias or start a new shell after updating the alias. Scripts, direct /usr/local/bin/brew invocations, and other shells are not transparently intercepted.
+
+Cloud jobs queries use the repository's GitHub Actions API. By default only queued, waiting, and in-progress Formula jobs are shown. With --all, active jobs plus jobs from up to 20 recent completed workflow runs are displayed (within the latest 100 workflow runs returned by GitHub). Older jobs without version metadata are labelled *version unverified*.
 
 ### Bottle selection and safety
 

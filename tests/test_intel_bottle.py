@@ -19,7 +19,7 @@ loader.exec_module(module)
 
 class BottleTests(unittest.TestCase):
     def test_passthrough_preserves_native_commands(self):
-        for args in (["list"], ["info", "llvm"], ["--version"], ["upgrade"], ["--help"]):
+        for args in (["list"], ["info", "llvm"], ["--version"], ["upgrade"]):
             with self.subTest(args=args), patch.object(module, "passthrough", return_value=42) as native:
                 self.assertEqual(module.main(args), 42)
                 native.assert_called_once_with(args)
@@ -236,6 +236,104 @@ class BottleTests(unittest.TestCase):
              patch.object(module, "dispatch_build") as dispatch:
             self.assertEqual(module.trigger_build(["aria2"]), 0)
             dispatch.assert_not_called()
+
+
+    def test_explicit_help_and_proxy_brew_help_are_distinct(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        # Direct extension: brew intel-bottle --help / -h / help
+        for args in (["--help"], ["-h"], ["help"],
+                     ["--proxy", "intel-bottle", "--help"],
+                     ["--proxy", "intel-bottle", "-h"]):
+            with self.subTest(args=args), patch.object(module, "passthrough") as native:
+                out = StringIO()
+                with redirect_stdout(out):
+                    self.assertEqual(module.main(args), 0)
+                self.assertIn("Usage: brew intel-bottle", out.getvalue())
+                self.assertIn("jobs [--all]", out.getvalue())
+                native.assert_not_called()
+
+        # Aliased brew --help and brew help retain the native Homebrew help.
+        for args in (["--proxy", "--help"], ["--proxy", "-h"],
+                     ["--proxy", "help"], ["--proxy"]):
+            with self.subTest(args=args), patch.object(module, "passthrough", return_value=19) as native:
+                self.assertEqual(module.main(args), 19)
+                native.assert_called_once_with(args[1:])
+
+    def test_proxy_preserves_native_info_and_enables_jobs(self):
+        with patch.object(module, "passthrough", return_value=17) as native:
+            self.assertEqual(module.main(["--proxy", "info", "aria2"]), 17)
+            native.assert_called_once_with(["info", "aria2"])
+        with patch.object(module, "parse_jobs_options", return_value=0) as jobs:
+            self.assertEqual(module.main(["--proxy", "jobs", "aria2"]), 0)
+            self.assertEqual(module.main(["--proxy", "intel-bottle", "jobs", "--all"]), 0)
+            self.assertEqual(jobs.call_count, 2)
+
+    def test_jobs_filtered_active_vs_all(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        queued = module.CloudJob("aria2", "1.37.0_3", "in_progress", None,
+                                 "https://example.test/active", 301, "in_progress")
+        failed = module.CloudJob("aria2", "1.37.0_2", "completed", "failure",
+                                 "https://example.test/failed", 299, "completed")
+        other = module.CloudJob("llvm", None, "queued", None,
+                                "https://example.test/llvm", 300, "queued")
+        with patch.object(module.WorkflowCatalog, "all", return_value=[queued, failed, other]):
+            out = StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(module.parse_jobs_options(["aria2"]), 0)
+            self.assertIn("aria2 1.37.0_3: in_progress", out.getvalue())
+            self.assertNotIn("1.37.0_2", out.getvalue())
+            self.assertNotIn("llvm", out.getvalue())
+
+            out = StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(module.parse_jobs_options(["--all", "aria2"]), 0)
+            self.assertIn("aria2 1.37.0_2: failure", out.getvalue())
+            self.assertIn("https://example.test/failed", out.getvalue())
+            self.assertNotIn("llvm", out.getvalue())
+
+            out = StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(module.parse_jobs_options([]), 0)
+            self.assertIn("version unverified", out.getvalue())
+            self.assertIn("llvm", out.getvalue())
+
+    def test_jobs_options_validation_and_help(self):
+        for args in (["--unknown"], ["aria2", "llvm"], ["--all", "-x"]):
+            with self.subTest(args=args), self.assertRaises(module.BottleError):
+                module.parse_jobs_options(args)
+        from contextlib import redirect_stdout
+        from io import StringIO
+        out = StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(module.parse_jobs_options(["--help"]), 0)
+        self.assertIn("jobs [--all] [FORMULA]", out.getvalue())
+
+    def test_job_catalog_excludes_coordinators_and_optional_history(self):
+        run = lambda i, status: {"id": i, "status": status,
+                                 "display_title": "old workflow",
+                                 "html_url": f"https://example.test/{i}"}
+        def responder(path):
+            if path.endswith("/runs?per_page=100"):
+                return {"workflow_runs": [run(9, "in_progress"), run(8, "completed")]}
+            if path.endswith("/9/jobs?per_page=100"):
+                return {"jobs": [
+                    {"name": "prepare", "status": "completed", "conclusion": "success"},
+                    {"name": "aria2", "status": "in_progress", "conclusion": None},
+                ]}
+            if path.endswith("/8/jobs?per_page=100"):
+                return {"jobs": [
+                    {"name": "publish", "status": "completed", "conclusion": "success"},
+                    {"name": "protobuf", "status": "completed", "conclusion": "failure"},
+                ]}
+            raise AssertionError(path)
+        with patch.object(module, "github_api", side_effect=responder) as api:
+            self.assertEqual([j.name for j in module.WorkflowCatalog(history_limit=0).all()], ["aria2"])
+            self.assertEqual([j.name for j in module.WorkflowCatalog(history_limit=20).all()],
+                             ["aria2", "protobuf"])
+            self.assertEqual(api.call_count, 5)
 
 
 if __name__ == "__main__":
