@@ -152,6 +152,23 @@ class BottleTests(unittest.TestCase):
             native.assert_not_called()
 
 
+    def test_verified_release_bottle_uses_scoped_developer_mode(self):
+        bottle = module.Bottle("rclone", "1.75.2", "rclone--1.75.2.sequoia.bottle.1.tar.gz",
+                               "0" * 64, "https://example.test/archive",
+                               "https://example.test/release", "any")
+        plan = [module.Planned("rclone", "1.75.2", "release", bottle)]
+        with (
+            patch.object(module, "check_platform", return_value="sequoia"),
+            patch.object(module, "installation_plan", return_value=plan),
+            patch.object(module, "download_verified", side_effect=lambda b, root: root / b.filename),
+            patch.object(module.subprocess, "call", return_value=0) as native,
+        ):
+            self.assertEqual(module.install(["rclone"], yes=True), 0)
+        args, kwargs = native.call_args
+        self.assertEqual(args[0][:2], [module.REAL_BREW, "install"])
+        self.assertTrue(args[0][2].endswith(bottle.filename))
+        self.assertEqual(kwargs["env"]["HOMEBREW_DEVELOPER"], "1")
+
     def test_bulk_formula_metadata(self):
         with patch.object(module, "brew", return_value=json.dumps({
             "formulae": [{"name": "aria2", "versions": {"stable": "1.37.0"}},

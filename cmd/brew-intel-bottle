@@ -667,7 +667,10 @@ def install(names: list[str], *, dry_run: bool = False, yes: bool = False) -> in
                 message("verifying GitHub bottle: " + item.bottle.filename)
                 archive = download_verified(item.bottle, root)
                 message("installing " + item.name + " using Homebrew")
-                rc = subprocess.call([REAL_BREW, "install", str(archive)])
+                # Homebrew 7 blocks local package paths except in developer mode.
+                # Enable it only for this already SHA-256-verified bottle.
+                env = dict(os.environ, HOMEBREW_DEVELOPER="1")
+                rc = subprocess.call([REAL_BREW, "install", str(archive)], env=env)
             if rc != 0:
                 return rc
     return 0
