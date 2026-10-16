@@ -20,12 +20,153 @@ loader.exec_module(module)
 class BottleTests(unittest.TestCase):
     def test_rejects_non_extension_commands(self):
         # A dedicated external command must never impersonate native brew.
-        for args in (["list"], ["info", "llvm"], ["--version"], ["upgrade"],
+        for args in (["list"], ["info", "llvm"], ["--version"],
                      ["intel-bottle", "list"], ["--proxy", "jobs"]):
             with self.subTest(args=args), patch.object(module, "passthrough") as native:
                 with self.assertRaisesRegex(module.BottleError, "unknown intel-bottle command"):
                     module.main(args)
                 native.assert_not_called()
+
+    def test_outdated_inventory_uses_homebrew_json_and_skips_pins(self):
+        from subprocess import CompletedProcess
+        payload = {
+            "formulae": [
+                {"name": "vim", "pinned": False},
+                {"name": "old-pinned", "pinned": True},
+                {"name": "vendor/tap/widget", "pinned": False},
+            ],
+            "casks": [{"name": "opencode-desktop", "pinned": False}],
+        }
+        with patch.object(module.subprocess, "run",
+                          return_value=CompletedProcess([], 1, stdout=json.dumps(payload), stderr="")) as native:
+            names, roots = module.outdated_inventory([])
+            self.assertEqual(names, ["vim", "vendor/tap/widget", "opencode-desktop"])
+            self.assertEqual([(r["name"], r["tap"], r["kind"]) for r in roots], [
+                ("vim", "homebrew/core", "formula"),
+                ("widget", "vendor/tap", "formula"),
+                ("opencode-desktop", "homebrew/cask", "cask"),
+            ])
+            native.assert_called_once_with(
+                [module.REAL_BREW, "outdated", "--json=v2"],
+                capture_output=True, text=True, check=False)
+
+    def test_outdated_no_updates_returns_empty(self):
+        from subprocess import CompletedProcess
+        with patch.object(module.subprocess, "run",
+                          return_value=CompletedProcess([], 0,
+                              stdout='{"formulae":[],"casks":[]}', stderr="")):
+            self.assertEqual(module.outdated_inventory(["rclone"]), ([], []))
+
+    def test_outdated_invalid_json_never_runs_install(self):
+        from subprocess import CompletedProcess
+        with patch.object(module.subprocess, "run",
+                          return_value=CompletedProcess([], 1, stdout="", stderr="error")):
+            with self.assertRaisesRegex(module.BottleError, "invalid JSON"):
+                module.outdated_inventory([])
+
+    def test_upgrade_only_outdated_selected_formula(self):
+        roots = [{"name": "vim", "tap": "homebrew/core", "kind": "formula"}]
+        with (
+            patch.object(module, "outdated_inventory", return_value=(["vim"], roots)) as outdated,
+            patch.object(module, "route_packages", return_value=2) as route,
+        ):
+            self.assertEqual(module.main(["upgrade", "vim", "rclone"]), 2)
+            outdated.assert_called_once_with(["vim", "rclone"])
+            route.assert_called_once_with(
+                ["vim"], dry_run=False, yes=False, native_command="upgrade",
+                resolved_roots=roots)
+
+    def test_upgrade_no_arguments_queries_all_outdated(self):
+        roots = [
+            {"name": "vim", "tap": "homebrew/core", "kind": "formula"},
+            {"name": "opencode-desktop", "tap": "homebrew/cask", "kind": "cask"},
+        ]
+        with (
+            patch.object(module, "outdated_inventory", return_value=(["vim", "opencode-desktop"], roots)) as outdated,
+            patch.object(module, "route_packages", return_value=2) as route,
+        ):
+            self.assertEqual(module.main(["upgrade"]), 2)
+            outdated.assert_called_once_with([])
+            route.assert_called_once_with(
+                ["vim", "opencode-desktop"], dry_run=False, yes=False,
+                native_command="upgrade", resolved_roots=roots)
+
+    def test_upgrade_up_to_date_does_nothing(self):
+        with (
+            patch.object(module, "outdated_inventory", return_value=([], [])),
+            patch.object(module, "route_packages") as route,
+            patch.object(module, "passthrough") as native,
+        ):
+            self.assertEqual(module.main(["upgrade", "rclone"]), 0)
+            route.assert_not_called()
+            native.assert_not_called()
+
+    def test_upgrade_split_blocks_native_on_missing_core_bottle(self):
+        items = [
+            {"name": "vim", "tap": "homebrew/core", "kind": "formula"},
+            {"name": "opencode-desktop", "tap": "homebrew/cask", "kind": "cask"},
+        ]
+        with (
+            patch.object(module, "outdated_inventory", return_value=(["vim", "opencode-desktop"], items)),
+            patch.object(module, "requested_packages") as lookup,
+            patch.object(module, "install", return_value=2) as core,
+            patch.object(module, "passthrough") as native,
+        ):
+            self.assertEqual(module.main(["upgrade"]), 2)
+            core.assert_called_once_with(["vim"], dry_run=False, yes=False)
+            native.assert_not_called()
+            lookup.assert_not_called()
+
+    def test_upgrade_split_native_uses_upgrade_not_install(self):
+        items = [
+            {"name": "vim", "tap": "homebrew/core", "kind": "formula"},
+            {"name": "bun", "tap": "oven-sh/bun", "kind": "formula",
+             "full_name": "oven-sh/bun/bun"},
+            {"name": "opencode-desktop", "tap": "homebrew/cask", "kind": "cask"},
+        ]
+        with (
+            patch.object(module, "outdated_inventory",
+                         return_value=(["vim", "oven-sh/bun/bun", "opencode-desktop"], items)),
+            patch.object(module, "requested_packages") as lookup,
+            patch.object(module, "install", return_value=0) as core,
+            patch.object(module, "passthrough", return_value=0) as native,
+        ):
+            self.assertEqual(module.main(["upgrade", "--dry-run", "--yes"]), 0)
+            core.assert_called_once_with(["vim"], dry_run=True, yes=True)
+            native.assert_called_once_with([
+                "upgrade", "--dry-run", "oven-sh/bun/bun", "opencode-desktop"])
+            lookup.assert_not_called()
+
+    def test_upgrade_invalid_flags_are_not_silently_ignored(self):
+        for args in (["upgrade", "--HEAD", "vim"], ["upgrade", "-v", "vim"]):
+            with self.subTest(args=args), patch.object(module, "outdated_inventory") as query:
+                with self.assertRaisesRegex(module.BottleError, "native 'brew upgrade'"):
+                    module.main(args)
+                query.assert_not_called()
+
+    def test_bulk_dependency_union_not_intersection(self):
+        info = lambda name: {"name": name, "tap": "homebrew/core",
+                             "versions": {"stable": "1"}, "bottle": {}}
+        with (
+            patch.object(module, "brew", return_value="shared\ndep-a\ndep-b") as native,
+            patch.object(module, "formula_infos", side_effect=lambda names: {n: info(n) for n in names}),
+            patch.object(module, "all_installed_versions", return_value={}),
+            patch.object(module.ReleaseCatalog, "find", return_value=None),
+        ):
+            plan = module.installation_plan(["a", "b", "c", "d"], "sequoia", module.ReleaseCatalog("sequoia"))
+            self.assertIn("dep-a", [p.name for p in plan])
+            self.assertIn("dep-b", [p.name for p in plan])
+            self.assertEqual([p.name for p in plan][-4:], ["a", "b", "c", "d"])
+            self.assertEqual(native.call_args_list[0].args,
+                             ("deps", "--union", "--topological", "--formula", "a", "b", "c", "d"))
+
+    def test_bulk_dependency_roots_use_for_each(self):
+        plan = [module.Planned(n, "1", "missing") for n in ("a", "b", "c", "d")]
+        with patch.object(module, "brew", return_value="a: b c\nb: c\nc:\nd:") as native:
+            jobs = module.build_candidates(plan, ["a", "b", "c", "d"])
+            self.assertEqual([j.name for j in jobs], ["a", "d"])
+            native.assert_called_once_with(
+                "deps", "--for-each", "--topological", "--formula", "a", "b", "c", "d")
 
     def test_rejects_unsupported_explicit_install_options(self):
         for args in (["install", "--cask", "opencode-desktop"],

@@ -128,7 +128,8 @@ def requested_packages(names: list[str]) -> list[dict[str, Any]]:
 
 
 def native_tap_install_args(
-    rest: list[str], names: list[str], roots: list[dict[str, Any]]
+    rest: list[str], names: list[str], roots: list[dict[str, Any]],
+    *, command: str = "install",
 ) -> list[str]:
     """Qualify third-party short names, for both Formulae and Casks."""
     qualified: dict[str, str] = {}
@@ -139,7 +140,7 @@ def native_tap_install_args(
         if not TAPPED_FORMULA_PATTERN.fullmatch(full_name):
             raise BottleError(f"unsafe resolved third-party package: {full_name}")
         qualified[requested] = full_name
-    return ["install", *(qualified.get(arg, arg) for arg in rest)]
+    return [command, *(qualified.get(arg, arg) for arg in rest)]
 
 
 def all_installed_versions() -> dict[str, list[str]]:
@@ -271,9 +272,7 @@ def validate_formula(name: str) -> None:
         raise BottleError("expected an unqualified Homebrew formula name, got: " + name)
 
 
-def dependencies(name: str) -> list[str]:
-    # brew deps --topological includes transitive required and recommended deps.
-    values = brew("deps", "--topological", "--formula", name).splitlines()
+def _normalize_dependencies(label: str, values: list[str]) -> list[str]:
     result: list[str] = []
     for value in values:
         value = value.strip()
@@ -282,10 +281,31 @@ def dependencies(name: str) -> list[str]:
         if "/" in value:
             if not value.startswith(CORE_TAP + "/"):
                 raise ThirdPartyDependency(
-                    f"{name} requires third-party dependency {value}"
+                    f"{label} requires third-party dependency {value}"
                 )
             value = value.rsplit("/", 1)[-1]
         result.append(value)
+    return result
+
+
+def dependencies(name: str) -> list[str]:
+    # brew deps --topological includes transitive required and recommended deps.
+    return _normalize_dependencies(
+        name, brew("deps", "--topological", "--formula", name).splitlines()
+    )
+
+
+def dependencies_for_each(names: list[str]) -> dict[str, list[str]]:
+    """Bulk dependency lookup for the cloud root scheduler."""
+    raw = brew("deps", "--for-each", "--topological", "--formula", *names)
+    result: dict[str, list[str]] = {}
+    for line in raw.splitlines():
+        label, sep, rest = line.partition(":")
+        if not sep or label not in names:
+            raise BottleError("unexpected brew deps --for-each output: " + line)
+        result[label] = _normalize_dependencies(label, rest.split())
+    if set(result) != set(names):
+        raise BottleError("incomplete brew deps --for-each output")
     return result
 
 
@@ -301,8 +321,18 @@ def installation_plan(names: list[str], tag: str, catalog: ReleaseCatalog) -> li
     queue: list[str] = []
     for name in names:
         validate_formula(name)
-        queue.extend(dependencies(name))
-        queue.append(name)
+    if len(names) >= 4:
+        # Without --union, brew deps for multiple formulae shows their
+        # INTERSECTION. With --union we get one topologically ordered query.
+        queue.extend(_normalize_dependencies(
+            ",".join(names),
+            brew("deps", "--union", "--topological", "--formula", *names).splitlines(),
+        ))
+        queue.extend(names)
+    else:
+        for name in names:
+            queue.extend(dependencies(name))
+            queue.append(name)
     # Each dependency appears before its dependents; preserve order without duplicates.
     queue = list(dict.fromkeys(queue))
     cellar = brew("--cellar")
@@ -499,7 +529,10 @@ def build_candidates(plan: list[Planned], requested: list[str]) -> list[Planned]
     if not missing:
         return []
     requested_missing = [name for name in requested if name in missing]
-    dep_map = {name: set(dependencies(name)) for name in requested_missing}
+    if len(requested_missing) >= 4:
+        dep_map = {name: set(deps) for name, deps in dependencies_for_each(requested_missing).items()}
+    else:
+        dep_map = {name: set(dependencies(name)) for name in requested_missing}
     roots = [
         name for name in requested_missing
         if not any(name in deps for parent, deps in dep_map.items() if parent != name)
@@ -675,12 +708,142 @@ def install(names: list[str], *, dry_run: bool = False, yes: bool = False) -> in
                 return rc
     return 0
 
+def outdated_inventory(names: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
+    """Read Homebrew's outdated JSON, including its Formula/Cask distinction.
+
+    Core Formulae appear unqualified. Third-party Formulae use their full Tap
+    names. Avoid a huge, redundant brew info call for bare "brew upgrade".
+    """
+    args = ["outdated", "--json=v2", *names]
+    result = subprocess.run([REAL_BREW, *args], capture_output=True, text=True, check=False)
+    # Homebrew outdated returns 1 when there ARE outdated packages.
+    if result.returncode not in (0, 1):
+        raise BottleError("brew outdated failed: " + (result.stderr.strip() or result.stdout.strip()))
+    try:
+        data = json.loads(result.stdout)
+    except ValueError as exc:
+        raise BottleError("brew outdated returned invalid JSON: " + result.stderr.strip()) from exc
+    if not isinstance(data, dict) or not isinstance(data.get("formulae"), list) or not isinstance(data.get("casks"), list):
+        raise BottleError("brew outdated returned unexpected data")
+    packages: dict[str, dict[str, Any]] = {}
+    for item in data["formulae"]:
+        if item.get("pinned", False):
+            continue
+        name = str(item["name"])
+        tap, basename = name.rsplit("/", 1) if "/" in name else (CORE_TAP, name)
+        packages[name] = {"name": basename, "tap": tap,
+                          "full_name": name, "kind": "formula"}
+    for item in data["casks"]:
+        if item.get("pinned", False):
+            continue
+        name = str(item["name"])
+        # Homebrew's outdated cask JSON supplies a token. Native Homebrew
+        # handles this already-installed cask, preserving its upgrade policy.
+        packages[name] = {"name": name, "tap": "homebrew/cask",
+                          "full_name": name, "kind": "cask"}
+    return list(packages), list(packages.values())
+
+
+def upgrade(names: list[str], *, dry_run: bool = False, yes: bool = False) -> int:
+    """Upgrade only outdated roots while keeping Core on verified bottles."""
+    outdated, roots = outdated_inventory(names)
+    if not outdated:
+        message("nothing outdated to upgrade")
+        return 0
+    message("outdated packages: " + ", ".join(outdated))
+    return route_packages(
+        outdated, dry_run=dry_run, yes=yes, native_command="upgrade",
+        resolved_roots=roots,
+    )
+
+
+def route_packages(
+    names: list[str], *, dry_run: bool = False, yes: bool = False,
+    native_command: str = "install",
+    resolved_roots: list[dict[str, Any]] | None = None,
+) -> int:
+    """Split Core and native-owned packages without Core source fallback."""
+
+    # Explicit third-party names may not be tapped yet; resolve all other
+    # names normally, then reconstruct the requested order.
+    explicit_third_party = [
+        name for name in names
+        if TAPPED_FORMULA_PATTERN.fullmatch(name)
+        and not name.startswith(CORE_TAP + "/")
+        and not name.startswith("homebrew/cask/")
+    ]
+    if resolved_roots is not None:
+        roots = resolved_roots
+        if len(roots) != len(names):
+            raise BottleError("mismatched outdated package metadata")
+    else:
+        inspect_names = [name for name in names if name not in explicit_third_party]
+        inspected = iter(requested_packages(inspect_names)) if inspect_names else iter(())
+        roots = []
+        for name in names:
+            if name in explicit_third_party:
+                tap, formula = name.rsplit("/", 1)
+                roots.append({"name": formula, "tap": tap,
+                              "full_name": name, "kind": "formula"})
+            else:
+                roots.append(next(inspected))
+
+    core_names = [
+        info["name"] for info in roots
+        if info.get("kind", "formula") == "formula" and info["tap"] == CORE_TAP
+    ]
+    native_names = [
+        name for name, info in zip(names, roots)
+        if info.get("kind", "formula") == "cask" or info["tap"] != CORE_TAP
+    ]
+    native_roots = [
+        info for info in roots
+        if info.get("kind", "formula") == "cask" or info["tap"] != CORE_TAP
+    ]
+    if core_names:
+        if native_names:
+            message("splitting core Formulae from native Casks/third-party packages")
+        try:
+            result = install(core_names, dry_run=dry_run, yes=yes)
+        except ThirdPartyDependency as exc:
+            # Never build a homebrew/core root locally as a fallback.
+            message(str(exc))
+            message("core Formula cannot be handled by Intel Bottle; "
+                    "use native Homebrew explicitly if local builds are acceptable")
+            return 2
+        if result != 0:
+            # A missing cloud bottle must block native installation: sending
+            # the original mixed request to brew would compile core locally.
+            if native_names:
+                message("native packages not started; resolve core bottle(s) first")
+            return result
+
+    if native_names:
+        details = [
+            (info.get("full_name") or f"{info['tap']}/{info['name']}")
+            + (" [Cask]" if info.get("kind") == "cask" else " [third-party Formula]")
+            for info in native_roots
+        ]
+        message("native Homebrew package(s): " + ", ".join(details))
+        # --yes belongs to intel-bottle, not native brew. Preserve dry-run.
+        native_rest = (["--dry-run"] if dry_run else []) + native_names
+        native_args = native_tap_install_args(
+            native_rest, native_names, native_roots, command=native_command,
+        )
+        return passthrough(native_args)
+    return 0
+
+
 
 HELP = """Usage: brew intel-bottle <command> [options]
 
 Manage verified Intel Homebrew Bottles for homebrew/core Formulae:
   install [--dry-run] [--yes] FORMULA [...]
       Prefer official bottles, then verified Intel GitHub Release bottles.
+  upgrade [--dry-run] [--yes] [PACKAGE ...]
+      Upgrade outdated, unpinned packages only; omit PACKAGE to check all.
+      Core Formulae use verified Intel bottles, then native brew upgrades
+      Casks/third-party Taps. Missing Core bottles prevent local source builds.
       Missing bottles can be scheduled for cloud builds; never silently
       compile missing core source packages locally.
   status FORMULA_OR_CASK
@@ -699,6 +862,7 @@ Casks and third-party Tap Formulae are installed with native Homebrew.
 Mixed requests are split: core Formulae use Intel Bottle planning first, then
 Casks/third-party Tap packages use native Homebrew. If core bottles are missing,
 native installation is postponed. Core Formulae never fall back to source builds.
+Missing Core bottles stop the operation instead of compiling locally.
 For all other Homebrew commands, use 'brew COMMAND' directly.
 The optional Bash function wrapper in ~/outland/configs/func.d/brew.func
 routes common subcommands and displays combined help for 'brew --help'.
@@ -718,7 +882,7 @@ def main(args: list[str]) -> int:
         print(HELP)
         return 0
     if cmd != "jobs" and rest in (["--help"], ["-h"]):
-        if cmd in {"install", "status", "build", "releases"}:
+        if cmd in {"install", "upgrade", "status", "build", "releases"}:
             print(HELP)
             return 0
     if cmd == "jobs":
@@ -775,67 +939,19 @@ def main(args: list[str]) -> int:
                 "usage: brew intel-bottle install [--dry-run] [--yes] FORMULA [...]; "
                 "use native 'brew install' for other Homebrew flags"
             )
-        # Explicit third-party names may not be tapped yet; resolve all other
-        # names normally, then reconstruct the requested order.
-        explicit_third_party = [
-            name for name in names
-            if TAPPED_FORMULA_PATTERN.fullmatch(name)
-            and not name.startswith(CORE_TAP + "/")
-            and not name.startswith("homebrew/cask/")
-        ]
-        inspect_names = [name for name in names if name not in explicit_third_party]
-        inspected = iter(requested_packages(inspect_names)) if inspect_names else iter(())
-        roots = []
-        for name in names:
-            if name in explicit_third_party:
-                tap, formula = name.rsplit("/", 1)
-                roots.append({"name": formula, "tap": tap,
-                              "full_name": name, "kind": "formula"})
-            else:
-                roots.append(next(inspected))
-
-        core_names = [
-            info["name"] for info in roots
-            if info.get("kind", "formula") == "formula" and info["tap"] == CORE_TAP
-        ]
-        native_names = [
-            name for name, info in zip(names, roots)
-            if info.get("kind", "formula") == "cask" or info["tap"] != CORE_TAP
-        ]
-        native_roots = [
-            info for info in roots
-            if info.get("kind", "formula") == "cask" or info["tap"] != CORE_TAP
-        ]
-        if core_names:
-            if native_names:
-                message("splitting core Formulae from native Casks/third-party packages")
-            try:
-                result = install(core_names, dry_run=dry_run, yes=yes)
-            except ThirdPartyDependency as exc:
-                # Never build a homebrew/core root locally as a fallback.
-                message(str(exc))
-                message("core Formula cannot be handled by Intel Bottle; "
-                        "use native Homebrew explicitly if local builds are acceptable")
-                return 2
-            if result != 0:
-                # A missing cloud bottle must block native installation: sending
-                # the original mixed request to brew would compile core locally.
-                if native_names:
-                    message("native packages not started; resolve core bottle(s) first")
-                return result
-
-        if native_names:
-            details = [
-                (info.get("full_name") or f"{info['tap']}/{info['name']}")
-                + (" [Cask]" if info.get("kind") == "cask" else " [third-party Formula]")
-                for info in native_roots
-            ]
-            message("native Homebrew package(s): " + ", ".join(details))
-            # --yes belongs to intel-bottle, not native brew. Preserve dry-run.
-            native_rest = (["--dry-run"] if dry_run else []) + native_names
-            native_args = native_tap_install_args(native_rest, native_names, native_roots)
-            return passthrough(native_args)
-        return 0
+        return route_packages(names, dry_run=dry_run, yes=yes)
+    if cmd == "upgrade":
+        dry_run, yes = "--dry-run" in rest, "--yes" in rest
+        names = [x for x in rest if x not in {"--dry-run", "--yes"}]
+        if any(
+            not (FORMULA_PATTERN.fullmatch(name) or TAPPED_FORMULA_PATTERN.fullmatch(name))
+            for name in names
+        ):
+            raise BottleError(
+                "usage: brew intel-bottle upgrade [--dry-run] [--yes] [PACKAGE ...]; "
+                "use native 'brew upgrade' for other Homebrew flags"
+            )
+        return upgrade(names, dry_run=dry_run, yes=yes)
     raise BottleError(
         f"unknown intel-bottle command: {cmd}; "
         "use 'brew intel-bottle --help' for supported commands"

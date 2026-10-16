@@ -27,6 +27,11 @@ The GitHub repository name is homebrew-intel-bottles, so its short Homebrew tap 
     # Install from Homebrew or a verified GitHub Release:
     brew intel-bottle install protobuf
 
+    # Upgrade only outdated packages, without compiling Core locally:
+    brew intel-bottle upgrade --dry-run vim
+    brew intel-bottle upgrade vim
+    brew intel-bottle upgrade --dry-run   # all outdated Formulae/Casks
+
     # Request a remote build, unless the same Formula version is already active:
     brew intel-bottle build llvm
 
@@ -47,6 +52,9 @@ The function is maintained in `~/outland/configs/func.d/brew.func`. Existing `~/
 | `brew install aria2` | `brew intel-bottle install aria2` |
 | `brew install bun`, `brew install opencode-desktop` | Intel Bottle entrypoint resolves Cask/Tap and delegates to native Homebrew |
 | `brew install xterm vim opencode-desktop` | Intel Bottle handles Core Formulae first; native Homebrew handles the Cask only after Core succeeds |
+| `brew upgrade vim` | Intel Bottle checks whether vim is outdated and upgrades with an official/verified Bottle |
+| `brew upgrade` | Find all outdated, unpinned packages and split Core Formulae from native Casks/Taps |
+| `brew upgrade --cask foo`, `brew upgrade -v vim` | Native Homebrew (unsupported extension flags) |
 | `brew install --cask foo`, `brew install --HEAD foo` | Native Homebrew (unsupported extension flags) |
 | `brew jobs`, `brew status aria2`, `brew build aria2`, `brew releases` | Intel Bottle external command |
 | `brew intel-bottle jobs` | Intel Bottle external command, **without double insertion** |
@@ -55,7 +63,7 @@ The function is maintained in `~/outland/configs/func.d/brew.func`. Existing `~/
 | `brew intel-bottle --help` | Intel Bottle help only |
 | `command brew --help` | Original Homebrew help only |
 
-Native options like `brew install --cask`, `--formula`, `--HEAD`, `-v`, `-n` are not interpreted by the extension. To bypass the Bash function for any command, use `command brew ...`; to temporarily disable it, use `unset -f brew`.
+Native options like `brew install --cask`, `--formula`, `--HEAD`, `-v`, `-n` are not interpreted by the extension. The `upgrade` router accepts the extension's `--dry-run` and `--yes` flags; other upgrade flags (such as `--cask` or `--greedy`) go to native Homebrew. To bypass the Bash function for any command, use `command brew ...`; to temporarily disable it, use `unset -f brew`.
 
 This wrapper affects only Bash sessions that source it; noninteractive scripts, other shells, and direct `/usr/local/bin/brew` invocations are unchanged.
 
@@ -74,6 +82,12 @@ If one `brew install` invocation mixes Core Formulae with Casks or third-party T
     brew install xterm vim opencode-desktop  # missing Core Bottle blocks Cask; no Core source fallback
     brew intel-bottle status opencode-desktop # Cask -> native Homebrew
     brew intel-bottle status bun             # shows Tap ownership; no cloud build
+
+### Upgrade routing
+
+`brew upgrade vim` first checks `brew outdated --json=v2 vim`. If it is already current, there is nothing to do. If outdated, the Core Formula is upgraded using the same verified-bottle planner as `install` (an old installed version does **not** count as current). The command `brew upgrade` (with no package arguments) takes the full `brew outdated --json=v2` list and skips pinned packages. In both cases, the Core group is handled **before** native `brew upgrade` for Casks and third-party Tap packages; Homebrew's Cask outdated policy is preserved. If any Core bottle is missing, processing stops, so other upgrades are deferred rather than triggering local Core compilation.
+
+Use `brew upgrade --dry-run` to inspect what would happen; it never installs or schedules jobs. Use `brew intel-bottle build FORMULA` to request missing cloud builds. `--yes` is an Intel Bottle option and is not forwarded to native Homebrew. Advanced flags or `command brew upgrade` bypass the router and **may** compile Core Formulae locally. Native Casks/third-party Formulae may still build their own dependencies locally.
 
 Cloud jobs queries use the repository's GitHub Actions API. By default only queued, waiting, and in-progress Formula jobs are shown. With --all, active jobs plus jobs from up to 20 recent completed workflow runs are displayed (within the latest 100 workflow runs returned by GitHub). Older jobs without version metadata are labelled *version unverified*.
 
