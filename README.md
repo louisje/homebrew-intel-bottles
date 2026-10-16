@@ -46,6 +46,7 @@ The function is maintained in `~/outland/configs/func.d/brew.func`. Existing `~/
 | --- | --- |
 | `brew install aria2` | `brew intel-bottle install aria2` |
 | `brew install bun`, `brew install opencode-desktop` | Intel Bottle entrypoint resolves Cask/Tap and delegates to native Homebrew |
+| `brew install xterm vim opencode-desktop` | Intel Bottle handles Core Formulae first; native Homebrew handles the Cask only after Core succeeds |
 | `brew install --cask foo`, `brew install --HEAD foo` | Native Homebrew (unsupported extension flags) |
 | `brew jobs`, `brew status aria2`, `brew build aria2`, `brew releases` | Intel Bottle external command |
 | `brew intel-bottle jobs` | Intel Bottle external command, **without double insertion** |
@@ -62,14 +63,15 @@ This wrapper affects only Bash sessions that source it; noninteractive scripts, 
 
 **Only `homebrew/core` Formulae use the Intel Bottle fallback and cloud builder.** Casks and third-party Tap Formulae always use native Homebrew, which decides whether to download a Cask, pour the Tap's own Bottle, or build locally from source. The helper identifies Formulae and Casks together using `brew info --json=v2` (without `--formula`), so `brew install opencode-desktop claude-code-history-viewer` no longer fails a Formula-only lookup. Third-party Cask tokens are passed with their full Tap name, such as `jhlee0409/tap/claude-code-history-viewer`. This applies to both `brew install oven-sh/bun/bun` and the unqualified `brew install bun`: the helper resolves the Tap and forwards `bun` as `oven-sh/bun/bun` to avoid choosing a conflicting `homebrew/core/bun` formula. Explicit third-party references are sent straight to native Homebrew even if their Tap is not yet installed (Homebrew can auto-tap).
 
-If a single `brew install` invocation mixes Formulae and Casks, or Core and third-party Formulae, **the entire batch is forwarded to native Homebrew** (including any Core dependencies). Similarly, Core Formulae whose dependency graph contains a third-party Formula fall back to native Homebrew. In these situations native Homebrew may compile from source locally; the extension prints a notice but never dispatches these third-party builds to GitHub Actions. To keep Core Formulae on the cloud Bottle path, install them separately. An explicit `brew intel-bottle build bun` is rejected when `bun` resolves to a third-party Tap.
+If one `brew install` invocation mixes Core Formulae with Casks or third-party Tap Formulae, **the request is split**. All `homebrew/core` roots are processed through Intel Bottle first. Only after their bottles have been installed does the command invoke native Homebrew for the Casks/third-party packages. If a Core Bottle is missing or its dependency graph contains a third-party Formula, the command **stops without running the native part**; it never falls back to source-compiling the Core roots. Install a Core root with native Homebrew explicitly using `command brew install …` only if local compilation is acceptable. Pure Cask/third-party requests still go straight to native Homebrew; they may involve local builds of their own dependencies. Explicit `brew intel-bottle build bun` is rejected when `bun` resolves to a third-party Tap.
 
     brew install aria2                       # homebrew/core -> Intel Bottle planner
     brew install bun                         # resolves -> native brew install oven-sh/bun/bun
-    brew install oven-sh/bun/bun              # third-party -> native Homebrew
-    brew install aria2 bun                   # mixed -> native Homebrew for both
+    brew install oven-sh/bun/bun             # third-party -> native Homebrew
+    brew install aria2 bun                   # core via Intel Bottle, then third-party native
     brew install opencode-desktop claude-code-history-viewer # Casks -> native Homebrew
-    brew install aria2 opencode-desktop      # mixed Formula/Cask -> native Homebrew
+    brew install aria2 opencode-desktop      # core via Intel Bottle, then Cask native
+    brew install xterm vim opencode-desktop  # missing Core Bottle blocks Cask; no Core source fallback
     brew intel-bottle status opencode-desktop # Cask -> native Homebrew
     brew intel-bottle status bun             # shows Tap ownership; no cloud build
 

@@ -410,7 +410,7 @@ class BottleTests(unittest.TestCase):
             ])
             own.assert_not_called()
 
-    def test_mixed_core_and_unqualified_third_party_is_native_batch(self):
+    def test_mixed_core_and_unqualified_third_party_is_split(self):
         roots = [
             {"name": "aria2", "tap": "homebrew/core"},
             {"name": "bun", "tap": "oven-sh/bun"},
@@ -418,11 +418,11 @@ class BottleTests(unittest.TestCase):
         with (
             patch.object(module, "requested_packages", return_value=roots),
             patch.object(module, "passthrough", return_value=16) as native,
-            patch.object(module, "install") as own,
+            patch.object(module, "install", return_value=0) as own,
         ):
             self.assertEqual(module.main(["install", "aria2", "bun"]), 16)
-            native.assert_called_once_with(["install", "aria2", "oven-sh/bun/bun"])
-            own.assert_not_called()
+            own.assert_called_once_with(["aria2"], dry_run=False, yes=False)
+            native.assert_called_once_with(["install", "oven-sh/bun/bun"])
 
     def test_core_formula_uses_planner_and_qualified_name_normalized(self):
         with (
@@ -437,7 +437,7 @@ class BottleTests(unittest.TestCase):
             own.assert_called_once_with(["aria2"], dry_run=True, yes=False)
             native.assert_not_called()
 
-    def test_core_with_noncore_dependency_uses_native_brew(self):
+    def test_core_with_noncore_dependency_never_compiles_locally(self):
         with (
             patch.object(module, "requested_packages",
                          return_value=[{"name": "aria2", "tap": "homebrew/core"}]),
@@ -446,8 +446,8 @@ class BottleTests(unittest.TestCase):
             )),
             patch.object(module, "passthrough", return_value=20) as native,
         ):
-            self.assertEqual(module.main(["install", "aria2"]), 20)
-            native.assert_called_once_with(["install", "aria2"])
+            self.assertEqual(module.main(["install", "aria2"]), 2)
+            native.assert_not_called()
 
     def test_core_dependency_full_name_is_preserved_or_rejected(self):
         with patch.object(module, "brew", return_value="homebrew/core/zlib\n"):
@@ -581,7 +581,7 @@ class BottleTests(unittest.TestCase):
             own.assert_not_called()
             cloud.assert_not_called()
 
-    def test_mixed_formula_and_cask_batch_native(self):
+    def test_mixed_formula_and_cask_split_in_dry_run(self):
         items = [
             {"name": "aria2", "tap": "homebrew/core", "kind": "formula"},
             {"name": "opencode-desktop", "tap": "homebrew/cask",
@@ -590,17 +590,73 @@ class BottleTests(unittest.TestCase):
         with (
             patch.object(module, "requested_packages", return_value=items),
             patch.object(module, "passthrough", return_value=0) as native,
-            patch.object(module, "install") as own,
+            patch.object(module, "install", return_value=0) as own,
             patch.object(module, "dispatch_build") as cloud,
         ):
             self.assertEqual(
                 module.main(["install", "--dry-run", "aria2", "opencode-desktop"]), 0
             )
-            native.assert_called_once_with(
-                ["install", "--dry-run", "aria2", "opencode-desktop"]
-            )
-            own.assert_not_called()
+            own.assert_called_once_with(["aria2"], dry_run=True, yes=False)
+            native.assert_called_once_with(["install", "--dry-run", "opencode-desktop"])
             cloud.assert_not_called()
+
+    def test_mixed_core_missing_bottle_blocks_native_without_local_build(self):
+        items = [
+            {"name": "xterm", "tap": "homebrew/core", "kind": "formula"},
+            {"name": "vim", "tap": "homebrew/core", "kind": "formula"},
+            {"name": "opencode-desktop", "tap": "homebrew/cask", "kind": "cask"},
+        ]
+        with (
+            patch.object(module, "requested_packages", return_value=items),
+            patch.object(module, "install", return_value=2) as own,
+            patch.object(module, "passthrough") as native,
+        ):
+            self.assertEqual(module.main(["install", "xterm", "vim", "opencode-desktop"]), 2)
+            own.assert_called_once_with(["xterm", "vim"], dry_run=False, yes=False)
+            native.assert_not_called()
+
+    def test_core_plan_finishes_before_native_install(self):
+        items = [
+            {"name": "xterm", "tap": "homebrew/core", "kind": "formula"},
+            {"name": "opencode-desktop", "tap": "homebrew/cask", "kind": "cask"},
+        ]
+        events = []
+        def core_install(*args, **kwargs):
+            events.append("core")
+            return 0
+        def native_install(*args):
+            events.append("native")
+            return 0
+        with (
+            patch.object(module, "requested_packages", return_value=items),
+            patch.object(module, "install", side_effect=core_install),
+            patch.object(module, "passthrough", side_effect=native_install),
+        ):
+            self.assertEqual(module.main(["install", "xterm", "opencode-desktop"]), 0)
+        self.assertEqual(events, ["core", "native"])
+
+    def test_explicit_third_party_and_core_do_not_delegate_core(self):
+        items = [{"name": "aria2", "tap": "homebrew/core"},
+                 {"name": "opencode-desktop", "tap": "homebrew/cask", "kind": "cask"}]
+        with (
+            patch.object(module, "requested_packages", return_value=items) as lookup,
+            patch.object(module, "install", return_value=0) as own,
+            patch.object(module, "passthrough", return_value=0) as native,
+        ):
+            self.assertEqual(module.main(
+                ["install", "aria2", "oven-sh/bun/bun", "opencode-desktop"]), 0)
+            lookup.assert_called_once_with(["aria2", "opencode-desktop"])
+            own.assert_called_once_with(["aria2"], dry_run=False, yes=False)
+            native.assert_called_once_with(["install", "oven-sh/bun/bun", "opencode-desktop"])
+
+    def test_intel_yes_flag_is_not_passed_to_native_brew(self):
+        items = [{"name": "opencode-desktop", "tap": "homebrew/cask", "kind": "cask"}]
+        with (
+            patch.object(module, "requested_packages", return_value=items),
+            patch.object(module, "passthrough", return_value=0) as native,
+        ):
+            self.assertEqual(module.main(["install", "--yes", "opencode-desktop"]), 0)
+            native.assert_called_once_with(["install", "opencode-desktop"])
 
     def test_explicit_cask_flag_is_not_a_native_brew_proxy(self):
         with (

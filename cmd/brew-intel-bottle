@@ -696,8 +696,9 @@ Manage verified Intel Homebrew Bottles for homebrew/core Formulae:
       Show this Intel Bottle help.
 
 Casks and third-party Tap Formulae are installed with native Homebrew.
-Mixed Formula/Cask or core/third-party batches are also delegated to native
-Homebrew; this can build source packages locally.
+Mixed requests are split: core Formulae use Intel Bottle planning first, then
+Casks/third-party Tap packages use native Homebrew. If core bottles are missing,
+native installation is postponed. Core Formulae never fall back to source builds.
 For all other Homebrew commands, use 'brew COMMAND' directly.
 The optional Bash function wrapper in ~/outland/configs/func.d/brew.func
 routes common subcommands and displays combined help for 'brew --help'.
@@ -774,47 +775,67 @@ def main(args: list[str]) -> int:
                 "usage: brew intel-bottle install [--dry-run] [--yes] FORMULA [...]; "
                 "use native 'brew install' for other Homebrew flags"
             )
-        # An explicit third-party reference can auto-tap on installation.
-        # Do not require brew info to work before the Tap has been added.
+        # Explicit third-party names may not be tapped yet; resolve all other
+        # names normally, then reconstruct the requested order.
         explicit_third_party = [
             name for name in names
             if TAPPED_FORMULA_PATTERN.fullmatch(name)
             and not name.startswith(CORE_TAP + "/")
+            and not name.startswith("homebrew/cask/")
         ]
-        if explicit_third_party:
-            message("third-party Tap formula(s): " + ", ".join(explicit_third_party))
-            # The fully qualified Formula may automatically add its Tap.
-            # Still qualify other short names, if their metadata is available.
-            shorts = [name for name in names if FORMULA_PATTERN.fullmatch(name)]
-            native_args = args
-            if shorts:
-                short_roots = requested_packages(shorts)
-                native_args = native_tap_install_args(rest, shorts, short_roots)
-            message("delegating the entire install to native Homebrew")
-            return passthrough(native_args)
-        roots = requested_packages(names)
-        native_only = [
+        inspect_names = [name for name in names if name not in explicit_third_party]
+        inspected = iter(requested_packages(inspect_names)) if inspect_names else iter(())
+        roots = []
+        for name in names:
+            if name in explicit_third_party:
+                tap, formula = name.rsplit("/", 1)
+                roots.append({"name": formula, "tap": tap,
+                              "full_name": name, "kind": "formula"})
+            else:
+                roots.append(next(inspected))
+
+        core_names = [
+            info["name"] for info in roots
+            if info.get("kind", "formula") == "formula" and info["tap"] == CORE_TAP
+        ]
+        native_names = [
+            name for name, info in zip(names, roots)
+            if info.get("kind", "formula") == "cask" or info["tap"] != CORE_TAP
+        ]
+        native_roots = [
             info for info in roots
             if info.get("kind", "formula") == "cask" or info["tap"] != CORE_TAP
         ]
-        if native_only:
-            # Native Homebrew handles all Casks and third-party Formulae,
-            # preserving their original install semantics and dependencies.
+        if core_names:
+            if native_names:
+                message("splitting core Formulae from native Casks/third-party packages")
+            try:
+                result = install(core_names, dry_run=dry_run, yes=yes)
+            except ThirdPartyDependency as exc:
+                # Never build a homebrew/core root locally as a fallback.
+                message(str(exc))
+                message("core Formula cannot be handled by Intel Bottle; "
+                        "use native Homebrew explicitly if local builds are acceptable")
+                return 2
+            if result != 0:
+                # A missing cloud bottle must block native installation: sending
+                # the original mixed request to brew would compile core locally.
+                if native_names:
+                    message("native packages not started; resolve core bottle(s) first")
+                return result
+
+        if native_names:
             details = [
                 (info.get("full_name") or f"{info['tap']}/{info['name']}")
                 + (" [Cask]" if info.get("kind") == "cask" else " [third-party Formula]")
-                for info in native_only
+                for info in native_roots
             ]
             message("native Homebrew package(s): " + ", ".join(details))
-            message("delegating the entire install to native Homebrew"
-                    + (" (including any homebrew/core Formulae)" if len(native_only) != len(roots) else ""))
-            return passthrough(native_tap_install_args(rest, names, roots))
-        try:
-            return install([info["name"] for info in roots], dry_run=dry_run, yes=yes)
-        except ThirdPartyDependency as exc:
-            message(str(exc))
-            message("delegating the entire install to native Homebrew")
-            return passthrough(args)
+            # --yes belongs to intel-bottle, not native brew. Preserve dry-run.
+            native_rest = (["--dry-run"] if dry_run else []) + native_names
+            native_args = native_tap_install_args(native_rest, native_names, native_roots)
+            return passthrough(native_args)
+        return 0
     raise BottleError(
         f"unknown intel-bottle command: {cmd}; "
         "use 'brew intel-bottle --help' for supported commands"
