@@ -878,21 +878,6 @@ def github_json(url: str) -> Any:
         return json.load(response)
 
 
-def recipe_version(content: str, kind: str) -> str | None:
-    """Extract the active stable Formula or Cask version, including revision."""
-    if kind == "formula":
-        # Simple DSL stable version; complex aliases/version blocks return unknown.
-        value = re.search(r'^\\s*version\\s+["\\x27]([^"\\x27]+)["\\x27]', content, re.M)
-        revision = re.search(r'^\\s*revision\\s+(\\d+)\\s*$', content, re.M)
-        # Formulae frequently infer versions from the URL. In that case only
-        # GitHub's historical API metadata can resolve them; never guess.
-        if not value:
-            return None
-        return value.group(1) + ("_" + revision.group(1) if revision and int(revision.group(1)) else "")
-    match = re.search(r'^\\s*version\\s+["\\x27]([^"\\x27]+)["\\x27]', content, re.M)
-    return match.group(1) if match else None
-
-
 def version_first_seen(entry: dict[str, Any]) -> str | None:
     """Find oldest verified commit in a bounded history for the *current version*.
 
