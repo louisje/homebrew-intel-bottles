@@ -909,48 +909,38 @@ def version_first_seen(entry: dict[str, Any]) -> str | None:
         data = json.loads(VERSION_DATE_CACHE.read_text())
         record = data.get(key, {})
         cached_at = datetime.fromisoformat(record["checked"])
-        if now - cached_at < timedelta(hours=24):
+        if now - cached_at < timedelta(hours=24) and record.get("date"):
+            return record.get("date")
+        if now - cached_at < timedelta(hours=1) and not record.get("date"):
             return record.get("date")
     except (OSError, ValueError, TypeError, KeyError):
         data = {}
 
-    # Homebrew Formula versions may be derived from their download URLs.
-    # Only claim first-seen dates when the exact DSL version can be verified.
-    seen = None
-    confirmed_boundary = False
+    # Homebrew's version bump commits commonly include the formula/token
+    # and exact new version in the subject. One API request replaces up to
+    # thirty historical source downloads. Only matching bump subjects count:
+    # unrelated recipe edits must never reset the update date.
+    date = None
     try:
-        for page in range(1, 2):
-            commits = github_json(
-                f"https://api.github.com/repos/{repo}/commits?"
-                f"path={quote(location, safe='/')}&per_page=30&page={page}"
-            )
-            if not commits:
-                confirmed_boundary = bool(seen)
-                break
-            for commit in commits:
-                sha = commit["sha"]
-                raw = ("https://raw.githubusercontent.com/" + repo + "/" + sha
-                       + "/" + location)
-                with urllib.request.urlopen(raw, timeout=12) as response:
-                    content = response.read().decode("utf-8")
-                historical = recipe_version(content, kind)
-                if historical is None:
-                    raise ValueError("unverifiable historical recipe version")
-                if historical == version:
-                    seen = commit["commit"]["committer"]["date"]
-                elif seen is not None:
-                    confirmed_boundary = True
-                    break
-                else:
-                    # Current version not found on this path. Likely stale API
-                    # metadata, renamed recipe, or unsupported DSL.
-                    confirmed_boundary = False
-                    break
-            if confirmed_boundary or (commits and seen is None):
-                break
+        commits = github_json(
+            f"https://api.github.com/repos/{repo}/commits?"
+            f"path={quote(location, safe='/')}&per_page=100"
+        )
+        candidate = None
+        for commit in commits:
+            subject = commit["commit"]["message"].splitlines()[0]
+            # Use a non-version boundary after the version to avoid matching
+            # 1.2.3 in 1.2.30, for example.
+            if re.search(
+                r"(?i)^" + re.escape(name) + r"\s+(?:v)?" +
+                re.escape(version) + r"(?![0-9A-Za-z._+-])", subject,
+            ):
+                candidate = commit["commit"]["committer"]["date"]
+        # The oldest matching bump is the earliest visible announcement.
+        # If history does not include the version bump, report unknown.
+        date = candidate
     except (OSError, ValueError, KeyError, IndexError, TypeError):
-        confirmed_boundary = False
-    date = seen if confirmed_boundary else None
+        pass
     try:
         VERSION_DATE_CACHE.parent.mkdir(parents=True, exist_ok=True)
         data[key] = {"checked": now.isoformat(), "date": date}
