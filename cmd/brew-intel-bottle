@@ -888,7 +888,7 @@ def version_first_seen(entry: dict[str, Any]) -> str | None:
         return None
     repo = "Homebrew/homebrew-core" if kind == "formula" else "Homebrew/homebrew-cask"
     location = ("Formula/" if kind == "formula" else "Casks/") + name[0].lower() + "/" + name + ".rb"
-    key = f"{repo}:{name}:{version}"
+    key = f"v2:{repo}:{name}:{version}"
     now = datetime.now(timezone.utc)
     try:
         data = json.loads(VERSION_DATE_CACHE.read_text())
@@ -1013,7 +1013,7 @@ def outdated_display(rest: list[str]) -> int:
             line += " [" + entry["kind"] + "] " + entry["installed"] + " -> " + entry["current"]
             line += "  (version first seen: " + ((entry["date"] or "unknown")[:10]) + ")"
         elif sort == "date":
-            line += "  (recipe modified: " + ((entry["date"] or "unknown")[:10]) + ")"
+            line += "  (version first seen: " + ((entry["date"] or "unknown")[:10]) + ")"
         print(line)
     return 0
 
