@@ -45,6 +45,28 @@ class OutdatedTests(unittest.TestCase):
             self.assertEqual(mod.outdated_display(["--sort=name", "--reverse"]), 0)
             self.assertEqual(out.getvalue().splitlines(), ["z", "a"])
 
+    def test_unknown_dates_always_last(self):
+        sample = {"formulae": [
+            {"name": "known", "current_version": "2"},
+            {"name": "unknown", "current_version": "3"}], "casks": []}
+        with patch.object(mod.subprocess, "run") as run, patch.object(
+            mod, "version_first_seen", side_effect=lambda e:
+                "2026-10-01T00:00:00Z" if e["name"] == "known" else None
+        ), redirect_stdout(StringIO()) as out:
+            run.return_value.returncode = 0
+            run.return_value.stdout = json.dumps(sample)
+            self.assertEqual(mod.outdated_display(["--sort=date", "--reverse"]), 0)
+            self.assertTrue(out.getvalue().splitlines()[0].startswith("known"))
+            self.assertTrue(out.getvalue().splitlines()[1].startswith("unknown"))
+
+    def test_revision_detection(self):
+        content = 'class Test < Formula\\n  version "1.2.3"\\n  revision 2\\nend'
+        self.assertEqual(mod.recipe_version(content, "formula"), "1.2.3_2")
+        self.assertIsNone(mod.recipe_version('url "https://host/app-1.2.3.tar.gz"', "formula"))
+
+    def test_current_cask_version_detection(self):
+        self.assertEqual(mod.recipe_version('version "4.3.2"', "cask"), "4.3.2")
+
     def test_bad_sort(self):
         with self.assertRaises(mod.BottleError):
             mod.outdated_display(["--sort=unknown"])
