@@ -646,47 +646,30 @@ def trigger_build(names: list[str], *, force: bool = False) -> int:
     return dispatch_build(candidates)
 
 
-def install(names: list[str], *, dry_run: bool = False, yes: bool = False) -> int:
-    tag = check_platform()
-    catalog = ReleaseCatalog(tag)
-    print("Checking Intel " + tag + " bottles...")
-    plan = installation_plan(names, tag, catalog)
-    print_plan(plan)
-    missing = [entry.name for entry in plan if entry.source == "missing"]
-    if missing:
-        candidates = build_candidates(plan, names)
-        bundled = set(missing) - {item.name for item in candidates}
-        message("missing bottles: " + ", ".join(missing))
-        if bundled:
-            message("dependency bottles to be built with their parent formula: "
-                    + ", ".join(sorted(bundled)))
-        new_jobs, existing = show_cloud_jobs(candidates, WorkflowCatalog())
-        if not new_jobs:
-            message("already queued/building on GitHub; no new job required"
-                    if existing else "no new build required")
+def ready_installation_plan(
+    plan: list[Planned], names: list[str],
+) -> tuple[list[Planned], list[str]]:
+    """Install only roots whose dependencies all have available bottles."""
+    missing = {entry.name for entry in plan if entry.source == "missing"}
+    if not missing:
+        return plan, []
+    ready: set[str] = set()
+    blocked: list[str] = []
+    for name in dict.fromkeys(names):
+        closure = set(dependencies(name)) | {name}
+        if closure & missing:
+            blocked.append(name)
         else:
-            message("new cloud jobs required: " + ", ".join(
-                item.name + "=" + item.version for item in new_jobs
-            ))
-        if dry_run:
-            return 0
-        if new_jobs and sys.stdin.isatty() and not yes:
-            answer = input("Schedule only the missing cloud jobs? [y/N] ").strip().lower()
-            if answer in {"y", "yes"}:
-                return 2 if dispatch_build(new_jobs) == 0 else 1
-        if new_jobs:
-            message("to build remotely: brew intel-bottle build "
-                    + " ".join(item.name for item in new_jobs))
-        return 2
-    if dry_run:
-        return 0
+            ready.update(closure)
+    return [item for item in plan if item.name in ready], blocked
 
+
+def install_available_bottles(plan: list[Planned], *, yes: bool = False) -> int:
     if not yes and any(entry.source == "release" for entry in plan) and sys.stdin.isatty():
         answer = input("Install the listed GitHub Release bottles? [y/N] ").strip().lower()
         if answer not in {"y", "yes"}:
             message("cancelled; nothing installed")
             return 1
-
     with tempfile.TemporaryDirectory(prefix="intel-bottles-") as work:
         root = Path(work)
         for item in plan:
@@ -700,13 +683,57 @@ def install(names: list[str], *, dry_run: bool = False, yes: bool = False) -> in
                 message("verifying GitHub bottle: " + item.bottle.filename)
                 archive = download_verified(item.bottle, root)
                 message("installing " + item.name + " using Homebrew")
-                # Homebrew 7 blocks local package paths except in developer mode.
-                # Enable it only for this already SHA-256-verified bottle.
                 env = dict(os.environ, HOMEBREW_DEVELOPER="1")
                 rc = subprocess.call([REAL_BREW, "install", str(archive)], env=env)
             if rc != 0:
                 return rc
     return 0
+
+
+def install(names: list[str], *, dry_run: bool = False, yes: bool = False) -> int:
+    tag = check_platform()
+    catalog = ReleaseCatalog(tag)
+    print("Checking Intel " + tag + " bottles...")
+    plan = installation_plan(names, tag, catalog)
+    print_plan(plan)
+    ready_plan, blocked = ready_installation_plan(plan, names)
+    missing = [entry.name for entry in plan if entry.source == "missing"]
+    if blocked:
+        message("waiting for cloud bottles: " + ", ".join(blocked))
+        message("ready to install now: " + (
+            ", ".join(name for name in names if name not in blocked) or "(none)"
+        ))
+    if dry_run:
+        return 0
+    # Preserve dependency-first order, without installing blocked dependencies.
+    result = install_available_bottles(ready_plan, yes=yes)
+    if result != 0:
+        return result
+    if not missing:
+        return 0
+    candidates = build_candidates(plan, names)
+    bundled = set(missing) - {item.name for item in candidates}
+    message("missing bottles: " + ", ".join(missing))
+    if bundled:
+        message("dependency bottles to be built with their parent formula: "
+                + ", ".join(sorted(bundled)))
+    new_jobs, existing = show_cloud_jobs(candidates, WorkflowCatalog())
+    if not new_jobs:
+        message("already queued/building on GitHub; no new job required"
+                if existing else "no new build required")
+    else:
+        message("new cloud jobs required: " + ", ".join(
+            item.name + "=" + item.version for item in new_jobs
+        ))
+    if new_jobs and sys.stdin.isatty() and not yes:
+        answer = input("Schedule only the missing cloud jobs? [y/N] ").strip().lower()
+        if answer in {"y", "yes"}:
+            return 2 if dispatch_build(new_jobs) == 0 else 1
+    if new_jobs:
+        message("to build remotely: brew intel-bottle build "
+                + " ".join(item.name for item in new_jobs))
+    return 2
+
 
 def outdated_inventory(names: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
     """Read Homebrew's outdated JSON, including its Formula/Cask distinction.
