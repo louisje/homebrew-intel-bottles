@@ -882,7 +882,6 @@ def recipe_version(content: str, kind: str) -> str | None:
     """Extract the active stable Formula or Cask version, including revision."""
     if kind == "formula":
         # Simple DSL stable version; complex aliases/version blocks return unknown.
-        stable = re.search(r'^\\s*url\\s+["\\x27][^"\\x27]+["\\x27]', content, re.M)
         value = re.search(r'^\\s*version\\s+["\\x27]([^"\\x27]+)["\\x27]', content, re.M)
         revision = re.search(r'^\\s*revision\\s+(\\d+)\\s*$', content, re.M)
         # Formulae frequently infer versions from the URL. In that case only
@@ -920,10 +919,10 @@ def version_first_seen(entry: dict[str, Any]) -> str | None:
     seen = None
     confirmed_boundary = False
     try:
-        for page in range(1, 4):
+        for page in range(1, 2):
             commits = github_json(
                 f"https://api.github.com/repos/{repo}/commits?"
-                f"path={quote(location, safe='/')}&per_page=100&page={page}"
+                f"path={quote(location, safe='/')}&per_page=30&page={page}"
             )
             if not commits:
                 confirmed_boundary = bool(seen)
