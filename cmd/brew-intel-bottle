@@ -932,7 +932,7 @@ def version_first_seen(entry: dict[str, Any]) -> str | None:
             # Use a non-version boundary after the version to avoid matching
             # 1.2.3 in 1.2.30, for example.
             if re.search(
-                r"(?i)^" + re.escape(name) + r"\s+(?:v)?" +
+                r"(?i)^" + re.escape(name) + r"(?::\s*(?:update\s+)?|\s+)(?:v)?" +
                 re.escape(version) + r"(?![0-9A-Za-z._+-])", subject,
             ):
                 candidate = commit["commit"]["committer"]["date"]
