@@ -963,6 +963,29 @@ def outdated_display(rest: list[str]) -> int:
         print(line)
     return 0
 
+OUTDATED_HELP = """Usage: brew outdated [options] [PACKAGE ...]
+
+List outdated Homebrew Formulae and Casks. This subcommand is handled by
+brew-intel-bottle; plain listings delegate to native Homebrew.
+
+Options:
+  --verbose             Show installed/current versions and recipe edit date
+  --sort=name            Sort by package name (A to Z)
+  --sort=date            Sort by latest Homebrew recipe edit date (oldest first)
+  --sort=installed       Sort by installed version string
+  --sort=current         Sort by current version string
+  --sort=version         Alias of --sort=current
+  --reverse              Reverse the chosen sort order
+  -h, --help             Show this outdated-specific help
+
+Other native brew outdated filters (such as --formula and --cask) are passed
+through. Enhanced formatting cannot be combined with --json=v2.
+Date means the latest GitHub commit on a Core/Cask recipe, not the upstream
+release date. Unknown/third-party dates are reported as unknown.
+To bypass the wrapper: command brew outdated [options].
+"""
+
+
 HELP = """Usage: brew intel-bottle <command> [options]
 
 Manage verified Intel Homebrew Bottles for homebrew/core Formulae:
@@ -1010,6 +1033,9 @@ def main(args: list[str]) -> int:
         if rest:
             raise BottleError("usage: brew intel-bottle --help")
         print(HELP)
+        return 0
+    if cmd == "outdated" and rest in (["--help"], ["-h"]):
+        print(OUTDATED_HELP)
         return 0
     if cmd != "jobs" and rest in (["--help"], ["-h"]):
         if cmd in {"install", "upgrade", "outdated", "status", "build", "releases"}:
