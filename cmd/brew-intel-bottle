@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 from urllib.parse import quote
+from datetime import datetime, timedelta, timezone
 import platform
 import re
 import shutil
@@ -864,6 +865,104 @@ def route_packages(
 
 
 
+# Avoid repeated GitHub history requests across brew outdated invocations.
+VERSION_DATE_CACHE = Path.home() / ".cache" / "brew-intel-bottle" / "version-dates.json"
+
+
+def github_json(url: str) -> Any:
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "brew-intel-bottle"}
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=12) as response:
+        return json.load(response)
+
+
+def recipe_version(content: str, kind: str) -> str | None:
+    """Extract the active stable Formula or Cask version, including revision."""
+    if kind == "formula":
+        # Simple DSL stable version; complex aliases/version blocks return unknown.
+        stable = re.search(r'^\\s*url\\s+["\\x27][^"\\x27]+["\\x27]', content, re.M)
+        value = re.search(r'^\\s*version\\s+["\\x27]([^"\\x27]+)["\\x27]', content, re.M)
+        revision = re.search(r'^\\s*revision\\s+(\\d+)\\s*$', content, re.M)
+        # Formulae frequently infer versions from the URL. In that case only
+        # GitHub's historical API metadata can resolve them; never guess.
+        if not value:
+            return None
+        return value.group(1) + ("_" + revision.group(1) if revision and int(revision.group(1)) else "")
+    match = re.search(r'^\\s*version\\s+["\\x27]([^"\\x27]+)["\\x27]', content, re.M)
+    return match.group(1) if match else None
+
+
+def version_first_seen(entry: dict[str, Any]) -> str | None:
+    """Find oldest verified commit in a bounded history for the *current version*.
+
+    Fail closed: inability to verify the version transition yields unknown.
+    """
+    name, kind, version = entry["name"], entry["kind"], entry["current"]
+    if not version or "/" in name:
+        return None
+    repo = "Homebrew/homebrew-core" if kind == "formula" else "Homebrew/homebrew-cask"
+    location = ("Formula/" if kind == "formula" else "Casks/") + name[0].lower() + "/" + name + ".rb"
+    key = f"{repo}:{name}:{version}"
+    now = datetime.now(timezone.utc)
+    try:
+        data = json.loads(VERSION_DATE_CACHE.read_text())
+        record = data.get(key, {})
+        cached_at = datetime.fromisoformat(record["checked"])
+        if now - cached_at < timedelta(hours=24):
+            return record.get("date")
+    except (OSError, ValueError, TypeError, KeyError):
+        data = {}
+
+    # Homebrew Formula versions may be derived from their download URLs.
+    # Only claim first-seen dates when the exact DSL version can be verified.
+    seen = None
+    confirmed_boundary = False
+    try:
+        for page in range(1, 4):
+            commits = github_json(
+                f"https://api.github.com/repos/{repo}/commits?"
+                f"path={quote(location, safe='/')}&per_page=100&page={page}"
+            )
+            if not commits:
+                confirmed_boundary = bool(seen)
+                break
+            for commit in commits:
+                sha = commit["sha"]
+                raw = ("https://raw.githubusercontent.com/" + repo + "/" + sha
+                       + "/" + location)
+                with urllib.request.urlopen(raw, timeout=12) as response:
+                    content = response.read().decode("utf-8")
+                historical = recipe_version(content, kind)
+                if historical is None:
+                    raise ValueError("unverifiable historical recipe version")
+                if historical == version:
+                    seen = commit["commit"]["committer"]["date"]
+                elif seen is not None:
+                    confirmed_boundary = True
+                    break
+                else:
+                    # Current version not found on this path. Likely stale API
+                    # metadata, renamed recipe, or unsupported DSL.
+                    confirmed_boundary = False
+                    break
+            if confirmed_boundary or (commits and seen is None):
+                break
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        confirmed_boundary = False
+    date = seen if confirmed_boundary else None
+    try:
+        VERSION_DATE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        data[key] = {"checked": now.isoformat(), "date": date}
+        temporary = VERSION_DATE_CACHE.with_suffix(".tmp")
+        temporary.write_text(json.dumps(data))
+        temporary.replace(VERSION_DATE_CACHE)
+    except OSError:
+        pass
+    return date
+
+
 def outdated_display(rest: list[str]) -> int:
     """Enhanced outdated view; native Homebrew remains the source of truth."""
     sorts = {"name", "date", "installed", "current", "version"}
@@ -909,36 +1008,10 @@ def outdated_display(rest: list[str]) -> int:
             entries.append({"name": str(item.get("name", "")), "kind": kind,
                             "installed": str(installed), "current": str(current), "date": None})
     
-    def modified_at(entry):
-        """Latest *recipe edit*, not upstream version release date."""
-        name = entry["name"]
-        if "/" in name:
-            return None  # Arbitrary tap histories cannot be mapped to homebrew/core.
-        if entry["kind"] == "formula":
-            repository = "Homebrew/homebrew-core"
-            path = "Formula/" + name[:1].lower() + "/" + name + ".rb"
-        else:
-            repository = "Homebrew/homebrew-cask"
-            path = "Casks/" + name[:1].lower() + "/" + name + ".rb"
-        url = ("https://api.github.com/repos/" + repository
-               + "/commits?path=" + quote(path, safe="/") + "&per_page=1")
-        headers = {"Accept": "application/vnd.github+json", "User-Agent": "brew-intel-bottle"}
-        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
-        if token:
-            headers["Authorization"] = "Bearer " + token
-        try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=8) as response:
-                commits = json.load(response)
-            if commits:
-                return commits[0]["commit"]["committer"]["date"]
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, KeyError, IndexError):
-            pass
-        return None
-    
     if verbose or sort == "date":
         for entry in entries:
-            entry["date"] = modified_at(entry)
-    
+            entry["date"] = version_first_seen(entry)
+
     def version_key(value):
         # Lexical sort is explicit: versions do not have a universal semantic ordering.
         return value.casefold()
@@ -950,14 +1023,21 @@ def outdated_display(rest: list[str]) -> int:
         "current": lambda e: (version_key(e["current"]), e["name"].casefold()),
         "version": lambda e: (version_key(e["current"]), e["name"].casefold()),
     }
-    entries.sort(key=key_funcs[sort], reverse=reverse)
+    if sort == "date":
+        # Unknown timestamps are always last, even in reverse order.
+        known = [e for e in entries if e["date"]]
+        unknown = [e for e in entries if not e["date"]]
+        known.sort(key=lambda e: (e["date"], e["name"].casefold()), reverse=reverse)
+        entries = known + sorted(unknown, key=lambda e: e["name"].casefold())
+    else:
+        entries.sort(key=key_funcs[sort], reverse=reverse)
     if not entries:
         return 0
     for entry in entries:
         line = entry["name"]
         if verbose:
             line += " [" + entry["kind"] + "] " + entry["installed"] + " -> " + entry["current"]
-            line += "  (recipe modified: " + ((entry["date"] or "unknown")[:10]) + ")"
+            line += "  (version first seen: " + ((entry["date"] or "unknown")[:10]) + ")"
         elif sort == "date":
             line += "  (recipe modified: " + ((entry["date"] or "unknown")[:10]) + ")"
         print(line)
@@ -998,7 +1078,7 @@ Manage verified Intel Homebrew Bottles for homebrew/core Formulae:
       Missing bottles can be scheduled for cloud builds; never silently
       compile missing core source packages locally.
   outdated [--verbose] [--sort=name|date|installed|current|version] [--reverse] [PACKAGE ...]
-      Native listing by default; enhanced mode supports sorting and recipe-edit dates.
+      Native listing by default; enhanced mode supports version-date sorting.
   status FORMULA_OR_CASK
       Show Bottle availability, Tap identity, and cloud build status.
   releases
