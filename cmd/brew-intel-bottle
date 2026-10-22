@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from urllib.parse import quote
 import platform
 import re
 import shutil
@@ -863,6 +864,105 @@ def route_packages(
 
 
 
+def outdated_display(rest: list[str]) -> int:
+    """Enhanced outdated view; native Homebrew remains the source of truth."""
+    sorts = {"name", "date", "installed", "current", "version"}
+    sort = "name"
+    reverse = False
+    verbose = False
+    native_args: list[str] = []
+    enhanced = False
+    for arg in rest:
+        if arg.startswith("--sort="):
+            sort = arg.partition("=")[2]
+            if sort not in sorts:
+                raise BottleError("unknown outdated sort: " + sort)
+            enhanced = True
+        elif arg == "--reverse":
+            reverse = True
+            enhanced = True
+        elif arg == "--verbose":
+            verbose = True
+            enhanced = True
+        else:
+            native_args.append(arg)
+    if not enhanced:
+        return passthrough(["outdated", *rest])
+    if any(arg in {"--json", "--json=v2", "--help", "-h"} for arg in native_args):
+        raise BottleError("enhanced outdated display cannot be combined with --json or --help")
+    result = subprocess.run([REAL_BREW, "outdated", "--json=v2", *native_args],
+                            capture_output=True, text=True, check=False)
+    if result.returncode not in (0, 1):
+        message(result.stderr.strip() or result.stdout.strip())
+        return result.returncode
+    try:
+        data = json.loads(result.stdout)
+    except (ValueError, TypeError) as exc:
+        raise BottleError("brew outdated returned invalid JSON: " + str(exc)) from exc
+    entries = []
+    for kind, key in (("formula", "formulae"), ("cask", "casks")):
+        for item in data.get(key, []):
+            installed = item.get("installed_versions") or item.get("installed_version") or []
+            if isinstance(installed, list):
+                installed = ", ".join(map(str, installed))
+            current = item.get("current_version") or ""
+            entries.append({"name": str(item.get("name", "")), "kind": kind,
+                            "installed": str(installed), "current": str(current), "date": None})
+    
+    def modified_at(entry):
+        """Latest *recipe edit*, not upstream version release date."""
+        name = entry["name"]
+        if "/" in name:
+            return None  # Arbitrary tap histories cannot be mapped to homebrew/core.
+        if entry["kind"] == "formula":
+            repository = "Homebrew/homebrew-core"
+            path = "Formula/" + name[:1].lower() + "/" + name + ".rb"
+        else:
+            repository = "Homebrew/homebrew-cask"
+            path = "Casks/" + name[:1].lower() + "/" + name + ".rb"
+        url = ("https://api.github.com/repos/" + repository
+               + "/commits?path=" + quote(path, safe="/") + "&per_page=1")
+        headers = {"Accept": "application/vnd.github+json", "User-Agent": "brew-intel-bottle"}
+        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        try:
+            with urlopen(Request(url, headers=headers), timeout=8) as response:
+                commits = json.load(response)
+            if commits:
+                return commits[0]["commit"]["committer"]["date"]
+        except (HTTPError, URLError, TimeoutError, ValueError, KeyError, IndexError):
+            pass
+        return None
+    
+    if verbose or sort == "date":
+        for entry in entries:
+            entry["date"] = modified_at(entry)
+    
+    def version_key(value):
+        # Lexical sort is explicit: versions do not have a universal semantic ordering.
+        return value.casefold()
+    
+    key_funcs = {
+        "name": lambda e: (e["name"].casefold(), e["kind"]),
+        "date": lambda e: (e["date"] is None, e["date"] or "", e["name"].casefold()),
+        "installed": lambda e: (version_key(e["installed"]), e["name"].casefold()),
+        "current": lambda e: (version_key(e["current"]), e["name"].casefold()),
+        "version": lambda e: (version_key(e["current"]), e["name"].casefold()),
+    }
+    entries.sort(key=key_funcs[sort], reverse=reverse)
+    if not entries:
+        return 0
+    for entry in entries:
+        line = entry["name"]
+        if verbose:
+            line += " [" + entry["kind"] + "] " + entry["installed"] + " -> " + entry["current"]
+            line += "  (recipe modified: " + ((entry["date"] or "unknown")[:10]) + ")"
+        elif sort == "date":
+            line += "  (recipe modified: " + ((entry["date"] or "unknown")[:10]) + ")"
+        print(line)
+    return 0
+
 HELP = """Usage: brew intel-bottle <command> [options]
 
 Manage verified Intel Homebrew Bottles for homebrew/core Formulae:
@@ -874,6 +974,8 @@ Manage verified Intel Homebrew Bottles for homebrew/core Formulae:
       Casks/third-party Taps. Missing Core bottles prevent local source builds.
       Missing bottles can be scheduled for cloud builds; never silently
       compile missing core source packages locally.
+  outdated [--verbose] [--sort=name|date|installed|current|version] [--reverse] [PACKAGE ...]
+      Native listing by default; enhanced mode supports sorting and recipe-edit dates.
   status FORMULA_OR_CASK
       Show Bottle availability, Tap identity, and cloud build status.
   releases
@@ -910,9 +1012,11 @@ def main(args: list[str]) -> int:
         print(HELP)
         return 0
     if cmd != "jobs" and rest in (["--help"], ["-h"]):
-        if cmd in {"install", "upgrade", "status", "build", "releases"}:
+        if cmd in {"install", "upgrade", "outdated", "status", "build", "releases"}:
             print(HELP)
             return 0
+    if cmd == "outdated":
+        return outdated_display(rest)
     if cmd == "jobs":
         return parse_jobs_options(rest)
     if cmd == "build":
