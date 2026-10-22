@@ -870,6 +870,15 @@ VERSION_DATE_CACHE = Path.home() / ".cache" / "brew-intel-bottle" / "version-dat
 
 
 def github_json(url: str) -> Any:
+    # Prefer the authenticated GitHub CLI on developer machines.
+    gh = shutil.which("gh")
+    if gh and url.startswith("https://api.github.com/"):
+        result = subprocess.run(
+            [gh, "api", url.removeprefix("https://api.github.com/")],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode == 0:
+            return json.loads(result.stdout)
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "brew-intel-bottle"}
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if token:
@@ -888,7 +897,7 @@ def version_first_seen(entry: dict[str, Any]) -> str | None:
         return None
     repo = "Homebrew/homebrew-core" if kind == "formula" else "Homebrew/homebrew-cask"
     location = ("Formula/" if kind == "formula" else "Casks/") + name[0].lower() + "/" + name + ".rb"
-    key = f"v2:{repo}:{name}:{version}"
+    key = f"v3:{repo}:{name}:{version}"
     now = datetime.now(timezone.utc)
     try:
         data = json.loads(VERSION_DATE_CACHE.read_text())
