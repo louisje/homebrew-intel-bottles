@@ -25,6 +25,7 @@ The GitHub repository name is homebrew-intel-bottles, so its short Homebrew tap 
     brew intel-bottle jobs --all aria2
 
     # Install from Homebrew or a verified GitHub Release:
+    brew intel-bottle outdated --verbose --sort=date --reverse
     brew intel-bottle install protobuf
 
     # Upgrade only outdated packages, without compiling Core locally:
@@ -49,6 +50,7 @@ The function is maintained in `~/outland/configs/func.d/brew.func`. Existing `~/
 
 | User command | Route |
 | --- | --- |
+| `brew outdated`, `brew outdated --verbose`, `brew outdated --sort=date --reverse` | Intel Bottle outdated handler (native output for plain command; enriched sorting when requested) |
 | `brew install aria2` | `brew intel-bottle install aria2` |
 | `brew install bun`, `brew install opencode-desktop` | Intel Bottle entrypoint resolves Cask/Tap and delegates to native Homebrew |
 | `brew install xterm vim opencode-desktop` | Intel Bottle handles Core Formulae first; native Homebrew handles the Cask only after Core succeeds |
@@ -82,6 +84,10 @@ If one `brew install` invocation mixes Core Formulae with Casks or third-party T
     brew install xterm vim opencode-desktop  # available Core roots install; missing ones and Cask wait
     brew intel-bottle status opencode-desktop # Cask -> native Homebrew
     brew intel-bottle status bun             # shows Tap ownership; no cloud build
+
+### Outdated listing
+
+The optional Bash wrapper sends **all** `brew outdated` calls to `brew intel-bottle outdated`. Without enhanced options, the command delegates to native Homebrew unchanged (including `--json=v2`). `--verbose` shows installed/current versions and the recipe edit date; `--sort=name|date|installed|current|version` sorts those records, and `--reverse` reverses the order. Version sorts are lexicographic. Recipe dates are based on the latest GitHub commit touching the Homebrew Core/Cask recipe, **not** the software release date; unknown dates and third-party Taps are labelled `unknown`. Dates may require one GitHub API call per package; for large lists, unauthenticated GitHub rate limits may apply. Native filters such as `--formula` and `--cask` pass through in enhanced mode. Use `command brew outdated ...` to bypass this wrapper.
 
 ### Upgrade routing
 
