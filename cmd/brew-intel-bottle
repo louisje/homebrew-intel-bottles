@@ -927,11 +927,11 @@ def outdated_display(rest: list[str]) -> int:
         if token:
             headers["Authorization"] = "Bearer " + token
         try:
-            with urlopen(Request(url, headers=headers), timeout=8) as response:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=8) as response:
                 commits = json.load(response)
             if commits:
                 return commits[0]["commit"]["committer"]["date"]
-        except (HTTPError, URLError, TimeoutError, ValueError, KeyError, IndexError):
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, KeyError, IndexError):
             pass
         return None
     
