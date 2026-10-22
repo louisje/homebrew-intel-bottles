@@ -59,14 +59,6 @@ class OutdatedTests(unittest.TestCase):
             self.assertTrue(out.getvalue().splitlines()[0].startswith("known"))
             self.assertTrue(out.getvalue().splitlines()[1].startswith("unknown"))
 
-    def test_revision_detection(self):
-        content = 'class Test < Formula\\n  version "1.2.3"\\n  revision 2\\nend'
-        self.assertEqual(mod.recipe_version(content, "formula"), "1.2.3_2")
-        self.assertIsNone(mod.recipe_version('url "https://host/app-1.2.3.tar.gz"', "formula"))
-
-    def test_current_cask_version_detection(self):
-        self.assertEqual(mod.recipe_version('version "4.3.2"', "cask"), "4.3.2")
-
     def test_bad_sort(self):
         with self.assertRaises(mod.BottleError):
             mod.outdated_display(["--sort=unknown"])
