@@ -703,12 +703,11 @@ def install(names: list[str], *, dry_run: bool = False, yes: bool = False) -> in
         message("ready to install now: " + (
             ", ".join(name for name in names if name not in blocked) or "(none)"
         ))
-    if dry_run:
-        return 0
-    # Preserve dependency-first order, without installing blocked dependencies.
-    result = install_available_bottles(ready_plan, yes=yes)
-    if result != 0:
-        return result
+    if not dry_run:
+        # Preserve dependency-first order, without installing blocked dependencies.
+        result = install_available_bottles(ready_plan, yes=yes)
+        if result != 0:
+            return result
     if not missing:
         return 0
     candidates = build_candidates(plan, names)
@@ -725,6 +724,8 @@ def install(names: list[str], *, dry_run: bool = False, yes: bool = False) -> in
         message("new cloud jobs required: " + ", ".join(
             item.name + "=" + item.version for item in new_jobs
         ))
+    if dry_run:
+        return 0
     if new_jobs and sys.stdin.isatty() and not yes:
         answer = input("Schedule only the missing cloud jobs? [y/N] ").strip().lower()
         if answer in {"y", "yes"}:
@@ -888,8 +889,8 @@ Manage verified Intel Homebrew Bottles for homebrew/core Formulae:
 Casks and third-party Tap Formulae are installed with native Homebrew.
 Mixed requests are split: core Formulae use Intel Bottle planning first, then
 Casks/third-party Tap packages use native Homebrew. If core bottles are missing,
-native installation is postponed. Core Formulae never fall back to source builds.
-Missing Core bottles stop the operation instead of compiling locally.
+native installation is postponed. Independent ready Core roots still install.\nCore Formulae never fall back to source builds.
+Missing Core bottles postpone dependent roots instead of compiling locally.
 For all other Homebrew commands, use 'brew COMMAND' directly.
 The optional Bash function wrapper in ~/outland/configs/func.d/brew.func
 routes common subcommands and displays combined help for 'brew --help'.
