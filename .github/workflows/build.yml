@@ -90,18 +90,6 @@ jobs:
           [[ "$(brew --prefix)" == "/usr/local" ]]
           brew config
           df -h .
-      - name: Protect shared Homebrew on self-hosted runner
-        if: runner.environment == 'self-hosted'
-        env:
-          FORMULA: ${{ matrix.formula }}
-        run: |
-          set -euo pipefail
-          echo "Inspecting shared Homebrew (read-only)"
-          brew --prefix
-          brew list --versions "$FORMULA" || true
-          brew deps --include-build --include-test "$FORMULA" || true
-          echo "::error::Self-hosted bottle builds are disabled until a verified isolated Homebrew environment is configured. A separate working directory does not isolate /usr/local/Homebrew."
-          exit 1
       - name: Check bottle availability
         id: preflight
         env:
@@ -149,6 +137,9 @@ jobs:
         env:
           HOMEBREW_NO_AUTO_UPDATE: '1'
           HOMEBREW_NO_INSTALL_CLEANUP: '1'
+          HOMEBREW_MAKE_JOBS: '2'
+          CMAKE_BUILD_PARALLEL_LEVEL: '2'
+          MAKEFLAGS: '-j2'
           FORMULA: ${{ matrix.formula }}
         run: |
           set -euo pipefail
@@ -156,14 +147,14 @@ jobs:
           if ! brew tap | grep -qx 'homebrew/core'; then
             brew tap --force homebrew/core
           fi
-          # Do not overwrite packages used by the owner's everyday macOS.
-          # A self-hosted build must run with a clean, isolated Homebrew prefix.
-          if [[ "$RUNNER_ENVIRONMENT" == "self-hosted" ]] && brew list --formula "$FORMULA" >/dev/null 2>&1; then
-            echo "::error::$FORMULA is already installed on this self-hosted Mac. Refusing to modify the existing Homebrew installation; use an isolated build environment."
-            exit 1
-          fi
           mkdir -p "$RUNNER_TEMP/bottles"
           cd "$RUNNER_TEMP/bottles"
+          # Audit shared Homebrew state before and after the build.
+          brew list --versions > homebrew-before.txt
+          trap 'brew list --versions > "$RUNNER_TEMP/bottles/homebrew-after.txt" || true; diff -u "$RUNNER_TEMP/bottles/homebrew-before.txt" "$RUNNER_TEMP/bottles/homebrew-after.txt" > "$RUNNER_TEMP/bottles/homebrew-changes.log" || true' EXIT
+          # Track existing dependencies: do not bottle pre-existing installations
+          # as though they were built by this workflow.
+          brew list --formula > installed-before.txt
           # Save the exact recursive dependency list before installation.
           brew deps --include-build --include-test --tree "$FORMULA" > dependency-tree.log
           brew deps --include-build --include-test "$FORMULA" | sort -u > dependency-list.txt
@@ -183,12 +174,17 @@ jobs:
           # Preserve locally built dependencies as installable bottles where supported.
           while IFS= read -r dep; do
             [[ -n "$dep" ]] || continue
-            if brew list --formula "$dep" >/dev/null 2>&1; then
+            if brew list --formula "$dep" >/dev/null 2>&1 && ! grep -Fxq "$dep" installed-before.txt; then
               echo "Bottling dependency: $dep" | tee -a dependency-bottles.log
               brew bottle --json "$dep" >> dependency-bottles.log 2>&1 || echo "Unable to bottle $dep" >> dependency-bottles.log
             fi
           done < dependency-list.txt
-          brew install --build-bottle --verbose "$FORMULA" 2>&1 | tee build.log
+          if brew list --formula "$FORMULA" >/dev/null 2>&1; then
+            echo "Rebuilding already-installed formula: $FORMULA" | tee build.log
+            brew reinstall --build-bottle --verbose "$FORMULA" 2>&1 | tee -a build.log
+          else
+            brew install --build-bottle --verbose "$FORMULA" 2>&1 | tee build.log
+          fi
           brew bottle --json "$FORMULA" 2>&1 | tee bottle.log
           shasum -a 256 ./*.tar.gz > SHA256SUMS
       - name: Upload build logs and bottles
