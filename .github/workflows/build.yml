@@ -127,7 +127,17 @@ jobs:
           # Save the exact recursive dependency list before installation.
           brew deps --include-build --include-test --tree "$FORMULA" > dependency-tree.log
           brew deps --include-build --include-test "$FORMULA" | sort -u > dependency-list.txt
-          brew install --only-dependencies --build-from-source --verbose "$FORMULA" 2>&1 | tee dependencies.log
+          # Prefer compatible official bottles; Homebrew builds dependencies from
+          # source when no usable bottle exists for this Intel macOS runner.
+          brew install --only-dependencies --verbose "$FORMULA" 2>&1 | tee dependencies.log
+          # Record which installed dependencies have local bottle metadata.
+          {
+            echo "Installed dependency versions:"
+            while IFS= read -r dep; do
+              [[ -n "$dep" ]] || continue
+              brew list --versions "$dep" || true
+            done < dependency-list.txt
+          } > dependency-installed.txt
           # Bottle dependencies before building the root, so they survive
           # even if the root Formula fails.
           # Preserve locally built dependencies as installable bottles where supported.
