@@ -180,11 +180,10 @@ jobs:
             fi
           done < dependency-list.txt
           if brew list --formula "$FORMULA" >/dev/null 2>&1; then
-            echo "Rebuilding already-installed formula: $FORMULA" | tee build.log
-            brew reinstall --build-bottle --verbose "$FORMULA" 2>&1 | tee -a build.log
-          else
-            brew install --build-bottle --verbose "$FORMULA" 2>&1 | tee build.log
+            echo "Removing installed $FORMULA before bottle build (temporarily unavailable)" | tee build.log
+            brew uninstall --ignore-dependencies --formula "$FORMULA" 2>&1 | tee -a build.log
           fi
+          brew install --build-bottle --verbose "$FORMULA" 2>&1 | tee -a build.log
           brew bottle --json "$FORMULA" 2>&1 | tee bottle.log
           shasum -a 256 ./*.tar.gz > SHA256SUMS
       - name: Upload build logs and bottles
