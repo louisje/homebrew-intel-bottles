@@ -90,6 +90,18 @@ jobs:
           [[ "$(brew --prefix)" == "/usr/local" ]]
           brew config
           df -h .
+      - name: Protect shared Homebrew on self-hosted runner
+        if: runner.environment == 'self-hosted'
+        env:
+          FORMULA: ${{ matrix.formula }}
+        run: |
+          set -euo pipefail
+          echo "Inspecting shared Homebrew (read-only)"
+          brew --prefix
+          brew list --versions "$FORMULA" || true
+          brew deps --include-build --include-test "$FORMULA" || true
+          echo "::error::Self-hosted bottle builds are disabled until a verified isolated Homebrew environment is configured. A separate working directory does not isolate /usr/local/Homebrew."
+          exit 1
       - name: Check bottle availability
         id: preflight
         env:
