@@ -140,6 +140,16 @@ jobs:
           FORMULA: ${{ matrix.formula }}
         run: |
           set -euo pipefail
+          # brew bottle requires a local core tap even when API installs work.
+          if ! brew tap | grep -qx 'homebrew/core'; then
+            brew tap --force homebrew/core
+          fi
+          # Do not overwrite packages used by the owner's everyday macOS.
+          # A self-hosted build must run with a clean, isolated Homebrew prefix.
+          if [[ "$RUNNER_ENVIRONMENT" == "self-hosted" ]] && brew list --formula "$FORMULA" >/dev/null 2>&1; then
+            echo "::error::$FORMULA is already installed on this self-hosted Mac. Refusing to modify the existing Homebrew installation; use an isolated build environment."
+            exit 1
+          fi
           mkdir -p "$RUNNER_TEMP/bottles"
           cd "$RUNNER_TEMP/bottles"
           # Save the exact recursive dependency list before installation.
