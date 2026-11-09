@@ -56,7 +56,7 @@ jobs:
   bottle:
     needs: prepare
     name: ${{ matrix.formula }} [${{ matrix.version }}]
-    runs-on: macos-15-intel
+    runs-on: [self-hosted, macOS, X64, intel-sequoia]
     timeout-minutes: 360
     strategy:
       fail-fast: false
