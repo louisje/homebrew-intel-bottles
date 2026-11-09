@@ -13,6 +13,14 @@ on:
         type: string
         required: false
         default: ''
+      runner:
+        description: 'Runner selection (auto distributes across local and GitHub Intel Macs)'
+        type: choice
+        options:
+          - auto
+          - self-hosted
+          - github-hosted
+        default: auto
       skip_if_bottled:
         description: 'Skip formulae already bottled for Intel Sequoia'
         type: boolean
@@ -31,6 +39,7 @@ jobs:
         env:
           FORMULAE: ${{ inputs.formulae }}
           VERSIONS: ${{ inputs.versions }}
+          RUNNER_MODE: ${{ inputs.runner }}
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os, re
@@ -48,15 +57,24 @@ jobs:
               if name in requested:
                   raise SystemExit("Duplicate pinned version: " + name)
               requested[name] = version
-          print("matrix=" + json.dumps({"include": [
-              {"formula": name, "version": requested.get(name, "")} for name in names
-          ]}))
+          mode = os.environ.get("RUNNER_MODE") or "auto"
+          if mode not in ("auto", "self-hosted", "github-hosted"):
+              raise SystemExit("Invalid runner mode: " + mode)
+          local = ["self-hosted", "macOS", "X64", "intel-sequoia"]
+          hosted = "macos-15-intel"
+          # Auto assigns one formula to the local runner; remaining formulae
+          # use GitHub-hosted runners. This is distribution, not live failover.
+          entries = []
+          for i, name in enumerate(names):
+              target = local if (mode == "self-hosted" or (mode == "auto" and i == 0)) else hosted
+              entries.append({"formula": name, "version": requested.get(name, ""), "runner": target})
+          print("matrix=" + json.dumps({"include": entries}))
           PY
 
   bottle:
     needs: prepare
     name: ${{ matrix.formula }} [${{ matrix.version }}]
-    runs-on: [self-hosted, macOS, X64, intel-sequoia]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
     strategy:
       fail-fast: false
