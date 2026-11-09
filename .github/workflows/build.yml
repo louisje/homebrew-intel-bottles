@@ -14,7 +14,7 @@ on:
         required: false
         default: ''
       runner:
-        description: 'Runner selection (auto distributes across local and GitHub Intel Macs)'
+        description: 'Runner selection (auto prefers GitHub, uses idle iMac when queue is backed up)'
         type: choice
         options:
           - auto
@@ -28,6 +28,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   prepare:
@@ -40,7 +41,15 @@ jobs:
           FORMULAE: ${{ inputs.formulae }}
           VERSIONS: ${{ inputs.versions }}
           RUNNER_MODE: ${{ inputs.runner }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
+          # Only repo-visible queue pressure is observable; this does not
+          # represent GitHub's global hosted-runner capacity.
+          queued=$(gh api "repos/$GH_REPO/actions/runs?status=queued&per_page=100" --jq '.total_count' 2>/dev/null || echo 0)
+          local_idle=$(gh api "repos/$GH_REPO/actions/runners?per_page=100" --jq '[.runners[] | select(.name == "imac-intel" and .status == "online" and .busy == false)] | length' 2>/dev/null || echo 0)
+          echo "Queued repository runs: $queued; idle iMac runners: $local_idle"
+          export QUEUED_RUNS="$queued" LOCAL_IDLE="$local_idle"
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os, re
           raw = os.environ.get("FORMULAE") or "llvm,rust,openvino,boost,protobuf"
@@ -62,11 +71,15 @@ jobs:
               raise SystemExit("Invalid runner mode: " + mode)
           local = ["self-hosted", "macOS", "X64", "intel-sequoia"]
           hosted = "macos-15-intel"
-          # Auto assigns one formula to the local runner; remaining formulae
-          # use GitHub-hosted runners. This is distribution, not live failover.
+          # Prefer hosted runners. When the repository already has a queue
+          # backlog, send one formula to the idle iMac to share the load.
+          # Explicit overrides remain available for manual failover.
+          backlog = int(os.environ.get("QUEUED_RUNS", "0")) >= 2
+          idle = int(os.environ.get("LOCAL_IDLE", "0")) > 0
           entries = []
           for i, name in enumerate(names):
-              target = local if (mode == "self-hosted" or (mode == "auto" and i == 0)) else hosted
+              use_local = mode == "self-hosted" or (mode == "auto" and backlog and idle and i == 0)
+              target = local if use_local else hosted
               entries.append({"formula": name, "version": requested.get(name, ""), "runner": target})
           print("matrix=" + json.dumps({"include": entries}))
           PY
