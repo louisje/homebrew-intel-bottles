@@ -1,5 +1,5 @@
 name: Build Intel Bottles
-run-name: Intel Bottles [${{ inputs.formulae }}] versions=[${{ inputs.versions }}]
+run-name: Intel Bottles [${{ inputs.formulae }}] versions=[${{ inputs.versions }}] runner=[${{ inputs.runner }}]
 on:
   workflow_dispatch:
     inputs:
@@ -46,7 +46,7 @@ jobs:
         run: |
           # Only repo-visible queue pressure is observable; this does not
           # represent GitHub's global hosted-runner capacity.
-          queued=$(gh api "repos/$GH_REPO/actions/runs?status=queued&per_page=100" --jq '.total_count' 2>/dev/null || echo 0)
+          queued=$(gh api "repos/$GH_REPO/actions/runs?status=queued&per_page=100" --jq '[.workflow_runs[] | select(.name == "Build Intel Bottles")] | length' 2>/dev/null || echo 0)
           local_idle=$(gh api "repos/$GH_REPO/actions/runners?per_page=100" --jq '[.runners[] | select(.name == "imac-intel" and .status == "online" and .busy == false)] | length' 2>/dev/null || echo 0)
           echo "Queued repository runs: $queued; idle iMac runners: $local_idle"
           export QUEUED_RUNS="$queued" LOCAL_IDLE="$local_idle"
