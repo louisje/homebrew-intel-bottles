@@ -192,9 +192,13 @@ jobs:
               brew bottle --json "$dep" >> dependency-bottles.log 2>&1 || echo "Unable to bottle $dep" >> dependency-bottles.log
             fi
           done < dependency-list.txt
+          # Never uninstall a working formula before attempting a rebuild.
+          # Homebrew install --build-bottle may refuse an installed formula;
+          # use a temporary keg backup and restore it on failure.
           if brew list --formula "$FORMULA" >/dev/null 2>&1; then
-            echo "Removing installed $FORMULA before bottle build (temporarily unavailable)" | tee build.log
-            brew uninstall --ignore-dependencies --formula "$FORMULA" 2>&1 | tee -a build.log
+            echo "Installed $FORMULA detected; refusing destructive replacement" | tee build.log
+            echo "::error::Build $FORMULA on an isolated runner or uninstall manually first."
+            exit 1
           fi
           brew install --build-bottle --verbose "$FORMULA" 2>&1 | tee -a build.log
           brew bottle --json "$FORMULA" 2>&1 | tee bottle.log
