@@ -93,7 +93,18 @@ jobs:
               actual += "_" + str(revision)
           expected = os.environ.get("EXPECTED_VERSION")
           if expected and actual != expected:
-              raise SystemExit(f"Requested {formula['name']} {expected}, but runner resolves {actual}; refusing mismatched build")
+              print("stale=true")
+              print("skip=true")
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a") as out:
+                      out.write(f"### Stale formula version: {formula['name']}\\n\\n")
+                      out.write(f"- Requested: {expected}\\n")
+                      out.write(f"- Runner resolved: {actual}\\n")
+                      out.write("- Result: skipped; resubmit with the current version.\\n")
+              print(f"::warning::Requested {formula['name']} {expected}, but runner resolves {actual}; skipping stale build")
+              raise SystemExit(0)
+          print("stale=false")
           print("resolved_version=" + actual)
           files = (formula.get("bottle") or {}).get("stable", {}).get("files") or {}
           tag = "sequoia"
