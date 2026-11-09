@@ -150,8 +150,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/bottles"
           cd "$RUNNER_TEMP/bottles"
           # Audit shared Homebrew state before and after the build.
-          brew list --versions > homebrew-before.txt
-          trap 'brew list --versions > "$RUNNER_TEMP/bottles/homebrew-after.txt" || true; diff -u "$RUNNER_TEMP/bottles/homebrew-before.txt" "$RUNNER_TEMP/bottles/homebrew-after.txt" > "$RUNNER_TEMP/bottles/homebrew-changes.log" || true' EXIT
+          brew list --formula --versions > homebrew-before.txt
+          trap 'brew list --formula --versions > "$RUNNER_TEMP/bottles/homebrew-after.txt" || true; diff -u "$RUNNER_TEMP/bottles/homebrew-before.txt" "$RUNNER_TEMP/bottles/homebrew-after.txt" > "$RUNNER_TEMP/bottles/homebrew-changes.log" || true' EXIT
           # Track existing dependencies: do not bottle pre-existing installations
           # as though they were built by this workflow.
           brew list --formula > installed-before.txt
