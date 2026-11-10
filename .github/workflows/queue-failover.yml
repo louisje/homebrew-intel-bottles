@@ -32,7 +32,11 @@ jobs:
         run: |
           set -euo pipefail
           idle=$(gh api "repos/$GH_REPO/actions/runners?per_page=100" --jq '[.runners[] | select(.name == "imac-intel" and .status == "online" and .busy == false)] | length' 2>/dev/null || echo 0)
-          [[ "$idle" == 1 ]] || { echo "iMac not idle"; exit 0; }
+          if [[ "$SIMULATE_QUEUED" == true && "$DRY_RUN" == true ]]; then
+            echo "SIMULATION: assuming iMac idle"
+            idle=1
+          fi
+          [[ "$idle" == 1 ]] || { echo "::warning::iMac idle status unavailable or busy; no failover"; exit 0; }
           if [[ "$SIMULATE_QUEUED" == true && "$DRY_RUN" != true ]]; then
             echo "::error::Synthetic queue requires dry-run"; exit 1
           fi
