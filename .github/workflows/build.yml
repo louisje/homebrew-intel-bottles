@@ -43,11 +43,15 @@ jobs:
           RUNNER_MODE: ${{ inputs.runner }}
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          RUNNER_READ_TOKEN: ${{ secrets.RUNNER_READ_TOKEN }}
         run: |
           # Only repo-visible queue pressure is observable; this does not
           # represent GitHub's global hosted-runner capacity.
           queued=$(gh api "repos/$GH_REPO/actions/runs?status=queued&per_page=100" --jq '[.workflow_runs[] | select(.name == "Build Intel Bottles")] | length' 2>/dev/null || echo 0)
-          local_idle=$(gh api "repos/$GH_REPO/actions/runners?per_page=100" --jq '[.runners[] | select(.name == "imac-intel" and .status == "online" and .busy == false)] | length' 2>/dev/null || echo 0)
+          local_idle=0
+          if [[ -n "$RUNNER_READ_TOKEN" ]]; then
+            local_idle=$(GH_TOKEN="$RUNNER_READ_TOKEN" gh api "repos/$GH_REPO/actions/runners?per_page=100" --jq '[.runners[] | select(.name == "imac-intel" and .status == "online" and .busy == false)] | length' 2>/dev/null || echo 0)
+          fi
           echo "Queued repository runs: $queued; idle iMac runners: $local_idle"
           export QUEUED_RUNS="$queued" LOCAL_IDLE="$local_idle"
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
@@ -194,7 +198,7 @@ jobs:
           done < dependency-list.txt
           # Never uninstall a working formula before attempting a rebuild.
           # Homebrew install --build-bottle may refuse an installed formula;
-          # use a temporary keg backup and restore it on failure.
+          # An isolated Homebrew prefix is required for rebuilding installed formulae.
           if brew list --formula "$FORMULA" >/dev/null 2>&1; then
             echo "Installed $FORMULA detected; refusing destructive replacement" | tee build.log
             echo "::error::Build $FORMULA on an isolated runner or uninstall manually first."
