@@ -3,6 +3,15 @@ on:
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only report failover decisions; never cancel or dispatch'
+        type: boolean
+        default: true
+      simulate_queued:
+        description: 'Use synthetic 15-minute queued job for decision test (dry-run only)'
+        type: boolean
+        default: false
 permissions:
   actions: write
   contents: read
@@ -17,25 +26,33 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+          SIMULATE_QUEUED: ${{ github.event_name == 'workflow_dispatch' && inputs.simulate_queued || false }}
         shell: bash
         run: |
           set -euo pipefail
           idle=$(gh api "repos/$GH_REPO/actions/runners?per_page=100" --jq '[.runners[] | select(.name == "imac-intel" and .status == "online" and .busy == false)] | length' 2>/dev/null || echo 0)
           [[ "$idle" == 1 ]] || { echo "iMac not idle"; exit 0; }
+          if [[ "$SIMULATE_QUEUED" == true && "$DRY_RUN" != true ]]; then
+            echo "::error::Synthetic queue requires dry-run"; exit 1
+          fi
           gh api "repos/$GH_REPO/actions/workflows/build.yml/runs?per_page=100" > "$RUNNER_TEMP/runs.json"
-          python3 - "$RUNNER_TEMP/runs.json" > "$RUNNER_TEMP/candidates.json" <<'PY'
+          python3 - "$RUNNER_TEMP/runs.json" "$SIMULATE_QUEUED" > "$RUNNER_TEMP/candidates.json" <<'PY'
           import datetime, json, re, sys
           now = datetime.datetime.now(datetime.timezone.utc)
           candidates = []
-          for run in json.load(open(sys.argv[1])).get("workflow_runs", []):
+          runs = json.load(open(sys.argv[1])).get("workflow_runs", [])
+          if sys.argv[2] == "true":
+              runs = [{"id": 0, "status": "queued", "display_title": "Intel Bottles [jq] versions=[] runner=[auto] skip=[false]", "created_at": (now - datetime.timedelta(minutes=15)).isoformat()}]
+          for run in runs:
               if run.get("status") not in ("queued", "in_progress"):
                   continue
-              match = re.fullmatch(r"Intel Bottles \[(.*?)\] versions=\[(.*?)\] runner=\[auto\]", run.get("display_title", ""))
+              match = re.fullmatch(r"Intel Bottles \[(.*?)\] versions=\[(.*?)\] runner=\[auto\] skip=\[(true|false)\]", run.get("display_title", ""))
               if not match:
                   continue
               age = (now - datetime.datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))).total_seconds()
               if age >= 600:
-                  candidates.append({"id": run["id"], "formulae": match.group(1), "versions": match.group(2)})
+                  candidates.append({"id": run["id"], "formulae": match.group(1), "versions": match.group(2), "skip": match.group(3)})
           print(json.dumps(candidates))
           PY
           count=$(jq length "$RUNNER_TEMP/candidates.json")
@@ -43,10 +60,19 @@ jobs:
             run_id=$(jq -r ".[$i].id" "$RUNNER_TEMP/candidates.json")
             formulae=$(jq -r ".[$i].formulae" "$RUNNER_TEMP/candidates.json")
             versions=$(jq -r ".[$i].versions" "$RUNNER_TEMP/candidates.json")
+            skip=$(jq -r ".[$i].skip" "$RUNNER_TEMP/candidates.json")
+            if [[ "$SIMULATE_QUEUED" == true ]]; then
+              echo "SIMULATION: 15-minute queued auto jq build is eligible for iMac fallback; skip=$skip"
+              continue
+            fi
             jobs=$(gh api --paginate "repos/$GH_REPO/actions/runs/$run_id/jobs?per_page=100" --jq '.jobs[] | select(.name != "prepare") | .status')
             [[ -n "$jobs" ]] || continue
             if grep -qv '^queued$' <<< "$jobs"; then
               echo "Run $run_id has started jobs; skip"
+              continue
+            fi
+            if [[ "$DRY_RUN" == true ]]; then
+              echo "DRY RUN: would cancel $run_id and redispatch $formulae on iMac (skip=$skip)"
               continue
             fi
             gh api -X POST "repos/$GH_REPO/actions/runs/$run_id/cancel" >/dev/null || continue
@@ -57,6 +83,6 @@ jobs:
               sleep 5
             done
             [[ "$cancelled" == true ]] || { echo "Cancellation not confirmed"; continue; }
-            gh workflow run build.yml -R "$GH_REPO" --ref main -f "formulae=$formulae" -f "versions=$versions" -f runner=self-hosted -f skip_if_bottled=true
+            gh workflow run build.yml -R "$GH_REPO" --ref main -f "formulae=$formulae" -f "versions=$versions" -f runner=self-hosted -f "skip_if_bottled=$skip"
             break
           done
