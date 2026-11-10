@@ -1,5 +1,5 @@
 name: Build Intel Bottles
-run-name: Intel Bottles [${{ inputs.formulae }}] versions=[${{ inputs.versions }}] runner=[${{ inputs.runner }}]
+run-name: Intel Bottles [${{ inputs.formulae }}] versions=[${{ inputs.versions }}] runner=[${{ inputs.runner }}] skip=[${{ inputs.skip_if_bottled }}]
 on:
   workflow_dispatch:
     inputs:
