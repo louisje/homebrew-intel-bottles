@@ -42,6 +42,7 @@ jobs:
             echo "SIMULATION: assuming iMac idle"
             idle=1
           fi
+          echo "Runner availability: idle=$idle (simulation=$SIMULATE_QUEUED)"
           [[ "$idle" == 1 ]] || { echo "::warning::iMac idle status unavailable or busy; no failover"; exit 0; }
           if [[ "$SIMULATE_QUEUED" == true && "$DRY_RUN" != true ]]; then
             echo "::error::Synthetic queue requires dry-run"; exit 1
