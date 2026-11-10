@@ -3,130 +3,60 @@ on:
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch:
-
 permissions:
   actions: write
   contents: read
-
 concurrency:
   group: intel-bottle-queue-failover
   cancel-in-progress: false
-
 jobs:
   failover:
     runs-on: ubuntu-latest
     steps:
-      - name: Reroute untouched queued auto runs after 10 minutes
+      - name: Check and reroute queued builds
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          WORKFLOW_ID: build.yml
         shell: bash
         run: |
           set -euo pipefail
-          # Never cancel a workflow after any bottle job has started.
           idle=$(gh api "repos/$GH_REPO/actions/runners?per_page=100" --jq '[.runners[] | select(.name == "imac-intel" and .status == "online" and .busy == false)] | length' 2>/dev/null || echo 0)
-          [[ "$idle" == 1 ]] || { echo "iMac not idle; no failover"; exit 0; }
-          gh api "repos/$GH_REPO/actions/workflows/$WORKFLOW_ID/runs?per_page=100" > "$RUNNER_TEMP/runs.json"
-          python3 - "$RUNNER_TEMP/runs.json" > "$RUNNER_TEMP/candidates.tsv" <<'PY'
+          [[ "$idle" == 1 ]] || { echo "iMac not idle"; exit 0; }
+          gh api "repos/$GH_REPO/actions/workflows/build.yml/runs?per_page=100" > "$RUNNER_TEMP/runs.json"
+          python3 - "$RUNNER_TEMP/runs.json" > "$RUNNER_TEMP/candidates.json" <<'PY'
           import datetime, json, re, sys
           now = datetime.datetime.now(datetime.timezone.utc)
+          candidates = []
           for run in json.load(open(sys.argv[1])).get("workflow_runs", []):
               if run.get("status") not in ("queued", "in_progress"):
                   continue
-              title = run.get("display_title", "")
-              match = re.fullmatch(r"Intel Bottles \[(.*?)\] versions=\[(.*?)\] runner=\[auto\]", title)
+              match = re.fullmatch(r"Intel Bottles \[(.*?)\] versions=\[(.*?)\] runner=\[auto\]", run.get("display_title", ""))
               if not match:
                   continue
               age = (now - datetime.datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))).total_seconds()
               if age >= 600:
-                  print(run["id"], match.group(1), match.group(2), sep="\t")
+                  candidates.append({"id": run["id"], "formulae": match.group(1), "versions": match.group(2)})
+          print(json.dumps(candidates))
           PY
-          while IFS=
-            [[ -n "$run_id" ]] || continue
+          count=$(jq length "$RUNNER_TEMP/candidates.json")
+          for ((i=0; i<count; i++)); do
+            run_id=$(jq -r ".[$i].id" "$RUNNER_TEMP/candidates.json")
+            formulae=$(jq -r ".[$i].formulae" "$RUNNER_TEMP/candidates.json")
+            versions=$(jq -r ".[$i].versions" "$RUNNER_TEMP/candidates.json")
             jobs=$(gh api --paginate "repos/$GH_REPO/actions/runs/$run_id/jobs?per_page=100" --jq '.jobs[] | select(.name != "prepare") | .status')
-            # Do not reroute before matrix preparation has completed.
             [[ -n "$jobs" ]] || continue
-            # A started, finished or cancelled bottle job makes full-run rerouting unsafe.
-            if grep -qv '^queued
-              echo "Run $run_id already has active/completed bottle jobs; skip"
+            if grep -qv '^queued$' <<< "$jobs"; then
+              echo "Run $run_id has started jobs; skip"
               continue
             fi
-            echo "Failover run $run_id ($formulae)"
             gh api -X POST "repos/$GH_REPO/actions/runs/$run_id/cancel" >/dev/null || continue
-            # Wait for cancellation to settle before dispatching a replacement.
             cancelled=false
             for attempt in {1..12}; do
-              status=$(gh api "repos/$GH_REPO/actions/runs/$run_id" --jq '.status')
-              if [[ "$status" == completed ]]; then cancelled=true; break; fi
+              state=$(gh api "repos/$GH_REPO/actions/runs/$run_id" --jq '[.status,.conclusion] | join(" ")')
+              if [[ "$state" == "completed cancelled" ]]; then cancelled=true; break; fi
               sleep 5
             done
-            [[ "$cancelled" == true ]] || { echo "Cancellation pending; no duplicate dispatch"; continue; }
-            gh workflow run "$WORKFLOW_ID" -R "$GH_REPO" --ref main \
-              -f "formulae=$formulae" -f "versions=$versions" -f runner=self-hosted -f skip_if_bottled=true
-            # One fallback per watchdog execution to avoid overloading the iMac.
+            [[ "$cancelled" == true ]] || { echo "Cancellation not confirmed"; continue; }
+            gh workflow run build.yml -R "$GH_REPO" --ref main -f "formulae=$formulae" -f "versions=$versions" -f runner=self-hosted -f skip_if_bottled=true
             break
-          done < "$RUNNER_TEMP/candidates.tsv"
- <<< "$jobs"; then
-              echo "Run $run_id already has active/completed bottle jobs; skip"
-              continue
-            fi
-            echo "Failover run $run_id ($formulae)"
-            gh api -X POST "repos/$GH_REPO/actions/runs/$run_id/cancel" >/dev/null || continue
-            # Wait for cancellation to settle before dispatching a replacement.
-            cancelled=false
-            for attempt in {1..12}; do
-              status=$(gh api "repos/$GH_REPO/actions/runs/$run_id" --jq '.status')
-              if [[ "$status" == completed ]]; then cancelled=true; break; fi
-              sleep 5
-            done
-            [[ "$cancelled" == true ]] || { echo "Cancellation pending; no duplicate dispatch"; continue; }
-            gh workflow run "$WORKFLOW_ID" -R "$GH_REPO" --ref main \
-              -f "formulae=$formulae" -f "versions=$versions" -f runner=self-hosted -f skip_if_bottled=true
-            # One fallback per watchdog execution to avoid overloading the iMac.
-            break
-          done < "$RUNNER_TEMP/candidates.tsv"
-\t' read -r run_id formulae versions; do
-            [[ -n "$run_id" ]] || continue
-            jobs=$(gh api --paginate "repos/$GH_REPO/actions/runs/$run_id/jobs?per_page=100" --jq '.jobs[] | select(.name != "prepare") | .status')
-            # Do not reroute before matrix preparation has completed.
-            [[ -n "$jobs" ]] || continue
-            # A started, finished or cancelled bottle job makes full-run rerouting unsafe.
-            if grep -qv '^queued
-              echo "Run $run_id already has active/completed bottle jobs; skip"
-              continue
-            fi
-            echo "Failover run $run_id ($formulae)"
-            gh api -X POST "repos/$GH_REPO/actions/runs/$run_id/cancel" >/dev/null || continue
-            # Wait for cancellation to settle before dispatching a replacement.
-            cancelled=false
-            for attempt in {1..12}; do
-              status=$(gh api "repos/$GH_REPO/actions/runs/$run_id" --jq '.status')
-              if [[ "$status" == completed ]]; then cancelled=true; break; fi
-              sleep 5
-            done
-            [[ "$cancelled" == true ]] || { echo "Cancellation pending; no duplicate dispatch"; continue; }
-            gh workflow run "$WORKFLOW_ID" -R "$GH_REPO" --ref main \
-              -f "formulae=$formulae" -f "versions=$versions" -f runner=self-hosted -f skip_if_bottled=true
-            # One fallback per watchdog execution to avoid overloading the iMac.
-            break
-          done < "$RUNNER_TEMP/candidates.tsv"
- <<< "$jobs"; then
-              echo "Run $run_id already has active/completed bottle jobs; skip"
-              continue
-            fi
-            echo "Failover run $run_id ($formulae)"
-            gh api -X POST "repos/$GH_REPO/actions/runs/$run_id/cancel" >/dev/null || continue
-            # Wait for cancellation to settle before dispatching a replacement.
-            cancelled=false
-            for attempt in {1..12}; do
-              status=$(gh api "repos/$GH_REPO/actions/runs/$run_id" --jq '.status')
-              if [[ "$status" == completed ]]; then cancelled=true; break; fi
-              sleep 5
-            done
-            [[ "$cancelled" == true ]] || { echo "Cancellation pending; no duplicate dispatch"; continue; }
-            gh workflow run "$WORKFLOW_ID" -R "$GH_REPO" --ref main \
-              -f "formulae=$formulae" -f "versions=$versions" -f runner=self-hosted -f skip_if_bottled=true
-            # One fallback per watchdog execution to avoid overloading the iMac.
-            break
-          done < "$RUNNER_TEMP/candidates.tsv"
+          done
