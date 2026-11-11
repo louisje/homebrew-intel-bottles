@@ -45,15 +45,12 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RUNNER_READ_TOKEN: ${{ secrets.RUNNER_READ_TOKEN }}
         run: |
-          # Only repo-visible queue pressure is observable; this does not
-          # represent GitHub's global hosted-runner capacity.
-          queued=$(gh api "repos/$GH_REPO/actions/runs?status=queued&per_page=100" --jq '[.workflow_runs[] | select(.name == "Build Intel Bottles")] | length' 2>/dev/null || echo 0)
           local_idle=0
           if [[ -n "$RUNNER_READ_TOKEN" ]]; then
             local_idle=$(GH_TOKEN="$RUNNER_READ_TOKEN" gh api "repos/$GH_REPO/actions/runners?per_page=100" --jq '[.runners[] | select(.name == "imac-intel" and .status == "online" and .busy == false)] | length' 2>/dev/null || echo 0)
           fi
-          echo "Queued repository runs: $queued; idle iMac runners: $local_idle"
-          export QUEUED_RUNS="$queued" LOCAL_IDLE="$local_idle"
+          echo "Idle iMac runners: $local_idle"
+          export LOCAL_IDLE="$local_idle"
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os, re
           raw = os.environ.get("FORMULAE") or "llvm,rust,openvino,boost,protobuf"
@@ -149,8 +146,22 @@ jobs:
           print("skip=" + str(available and os.getenv("SKIP_IF_BOTTLED", "true").lower() == "true").lower())
           PY
           brew unbottled --tag=sequoia 2>&1 | head -80 || true
-      - name: Build dependencies and bottle
+      - name: Guard existing local formula before dependency installation
+        id: local_guard
         if: steps.preflight.outputs.skip != 'true'
+        env:
+          FORMULA: ${{ matrix.formula }}
+        run: |
+          set -euo pipefail
+          if brew list --formula "$FORMULA" >/dev/null 2>&1; then
+            echo "installed=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::$FORMULA is already installed on this runner; skipping without changing Homebrew"
+            echo "### Skipped: $FORMULA is already installed" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "installed=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build dependencies and bottle
+        if: steps.preflight.outputs.skip != 'true' && steps.local_guard.outputs.installed != 'true'
         env:
           HOMEBREW_NO_AUTO_UPDATE: '1'
           HOMEBREW_NO_INSTALL_CLEANUP: '1'
@@ -196,9 +207,8 @@ jobs:
               brew bottle --json "$dep" >> dependency-bottles.log 2>&1 || echo "Unable to bottle $dep" >> dependency-bottles.log
             fi
           done < dependency-list.txt
-          # Never uninstall a working formula before attempting a rebuild.
-          # Homebrew install --build-bottle may refuse an installed formula;
-          # An isolated Homebrew prefix is required for rebuilding installed formulae.
+          # Recheck after dependencies to guard against concurrent installations.
+          # Never uninstall a working formula to rebuild it.
           if brew list --formula "$FORMULA" >/dev/null 2>&1; then
             echo "Installed $FORMULA detected; refusing destructive replacement" | tee build.log
             echo "::error::Build $FORMULA on an isolated runner or uninstall manually first."
