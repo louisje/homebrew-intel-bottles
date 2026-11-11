@@ -1071,6 +1071,8 @@ Manage verified Intel Homebrew Bottles for homebrew/core Formulae:
       --force explicitly overrides duplicate protection.
   jobs [--all] [FORMULA]
       List active cloud jobs; --all includes recent completed jobs.
+  inventory [--sync|--status]
+      Inspect, sync or check the iMac Homebrew formula inventory.
   help, -h, --help
       Show this Intel Bottle help.
 
@@ -1086,6 +1088,9 @@ routes common subcommands and displays combined help for 'brew --help'.
 
 
 def main(args: list[str]) -> int:
+    if args and args[0] == "inventory":
+        from inventory import run as inventory_run
+        return inventory_run(args[1:])
     # This is a dedicated Homebrew external command, never the top-level
     # brew proxy. The optional Bash function decides which commands enter it.
     if not args:
