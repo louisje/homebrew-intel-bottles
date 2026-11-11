@@ -51,8 +51,14 @@ jobs:
           fi
           echo "Idle iMac runners: $local_idle"
           export LOCAL_IDLE="$local_idle"
+          inventory_file="$RUNNER_TEMP/imac-inventory.json"
+          if [[ "$local_idle" -gt 0 ]]; then
+            gh api "repos/$GH_REPO/contents/.github/runner-inventory/imac-intel.json" --jq .content 2>/dev/null | base64 -d > "$inventory_file" || true
+          fi
+          export INVENTORY_FILE="$inventory_file"
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os, re
+          from datetime import datetime, timezone
           raw = os.environ.get("FORMULAE") or "llvm,rust,openvino,boost,protobuf"
           names = list(dict.fromkeys(x.strip() for x in raw.split(",") if x.strip()))
           if not names or len(names) > 20 or any(not re.fullmatch(r"[a-zA-Z0-9@+_.-]+", n) for n in names):
@@ -77,9 +83,21 @@ jobs:
           # Single-formula auto builds remain GitHub-hosted by default.
           idle = int(os.environ.get("LOCAL_IDLE", "0")) > 0
           share_local = mode == "auto" and idle and len(names) > 1
+          eligible = None
+          if share_local:
+              try:
+                  inventory = json.load(open(os.environ["INVENTORY_FILE"]))
+                  timestamp = datetime.fromisoformat(inventory["updated_at"].replace("Z", "+00:00"))
+                  age = (datetime.now(timezone.utc) - timestamp).total_seconds()
+                  if inventory.get("runner") == "imac-intel" and inventory.get("schema") == 1 and 0 <= age <= 86400 and isinstance(inventory.get("formulae"), dict):
+                      eligible = next((name for name in names if name not in inventory["formulae"]), None)
+                  else:
+                      print("iMac inventory stale or invalid; hosted-only", file=__import__("sys").stderr)
+              except (OSError, ValueError, KeyError, TypeError):
+                  print("iMac inventory unavailable; hosted-only", file=__import__("sys").stderr)
           entries = []
           for i, name in enumerate(names):
-              use_local = mode == "self-hosted" or (share_local and i == 0)
+              use_local = mode == "self-hosted" or (share_local and name == eligible)
               target = local if use_local else hosted
               entries.append({"formula": name, "version": requested.get(name, ""), "runner": target})
           print("matrix=" + json.dumps({"include": entries}))
