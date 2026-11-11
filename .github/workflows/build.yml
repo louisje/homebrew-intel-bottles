@@ -14,7 +14,7 @@ on:
         required: false
         default: ''
       runner:
-        description: 'Runner selection (auto prefers GitHub, uses idle iMac when queue is backed up)'
+        description: 'Runner selection (auto assigns one job to idle iMac in multi-formula batches)'
         type: choice
         options:
           - auto
@@ -75,14 +75,14 @@ jobs:
               raise SystemExit("Invalid runner mode: " + mode)
           local = ["self-hosted", "macOS", "X64", "intel-sequoia"]
           hosted = "macos-15-intel"
-          # Prefer hosted runners. When the repository already has a queue
-          # backlog, send one formula to the idle iMac to share the load.
-          # Explicit overrides remain available for manual failover.
-          backlog = int(os.environ.get("QUEUED_RUNS", "0")) >= 2
+          # Prefer GitHub-hosted runners, but share one formula with an idle
+          # iMac for multi-formula batches. Never migrate running jobs.
+          # Single-formula auto builds remain GitHub-hosted by default.
           idle = int(os.environ.get("LOCAL_IDLE", "0")) > 0
+          share_local = mode == "auto" and idle and len(names) > 1
           entries = []
           for i, name in enumerate(names):
-              use_local = mode == "self-hosted" or (mode == "auto" and backlog and idle and i == 0)
+              use_local = mode == "self-hosted" or (share_local and i == 0)
               target = local if use_local else hosted
               entries.append({"formula": name, "version": requested.get(name, ""), "runner": target})
           print("matrix=" + json.dumps({"include": entries}))
