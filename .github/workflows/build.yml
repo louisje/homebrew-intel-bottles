@@ -134,7 +134,7 @@ jobs:
           brew update
           brew info --json=v2 "$FORMULA" > "$RUNNER_TEMP/formula-info.json"
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json, os
+          import json, os, sys
           data = json.load(open(os.environ["RUNNER_TEMP"] + "/formula-info.json"))
           formula = data["formulae"][0]
           actual = str(formula["versions"]["stable"])
@@ -148,11 +148,11 @@ jobs:
               summary = os.environ.get("GITHUB_STEP_SUMMARY")
               if summary:
                   with open(summary, "a") as out:
-                      out.write(f"### Stale formula version: {formula['name']}\\n\\n")
-                      out.write(f"- Requested: {expected}\\n")
-                      out.write(f"- Runner resolved: {actual}\\n")
-                      out.write("- Result: skipped; resubmit with the current version.\\n")
-              print(f"::warning::Requested {formula['name']} {expected}, but runner resolves {actual}; skipping stale build")
+                      out.write(f"### Stale formula version: {formula['name']}\n\n")
+                      out.write(f"- Requested: {expected}\n")
+                      out.write(f"- Runner resolved: {actual}\n")
+                      out.write("- Result: skipped; resubmit with the current version.\n")
+              print(f"::warning::Requested {formula['name']} {expected}, but runner resolves {actual}; skipping stale build", file=sys.stderr)
               raise SystemExit(0)
           print("stale=false")
           print("resolved_version=" + actual)
